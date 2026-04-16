@@ -244,4 +244,4 @@ autobuilderclaude --input docs/plan.md --task 3 --model sonnet
 
 Copyright (C) 2026 Kris Kirby
 
-<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+SPDX-License-Identifier: GPL-3.0-or-later 
