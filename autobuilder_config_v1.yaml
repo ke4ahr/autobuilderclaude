@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Kris Kirby
+# https://github.com/ke4ahr/autobuilderclaude
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+# autobuilder_config_v1.yaml
+# Runtime configuration for auto-builder.py (format v1).
+#
+# Usage:
+#   autobuilderclaude.py --input plan.md --config this_file.yaml
+#
+# Copy this file, fill in all required fields, and pass it via --config.
+# Values here override any matching key in the plan's ## Build Config block.
+# Remove comments from production copies if desired.
+#
+# INSTRUCTIONS FOR THE CLAUDE INSTANCE WRITING A CONFIG:
+#   Replace every <PLACEHOLDER> with a real absolute path or value.
+#   All paths must be absolute. Relative paths are not supported.
+#   Remove this comment block from the production file.
+
+# ---------------------------------------------------------------------------
+# Required
+# ---------------------------------------------------------------------------
+
+# Absolute path to the project repository root.
+# claude receives "Working directory: {repo}" as the first line of every prompt.
+repo: <absolute path to repo root>
+
+# Directory for build logs. Created automatically if it does not exist.
+# Recommended: one level above the repo (sibling directory).
+# Example: if repo is /home/user/project, use /home/user/tmp_build_logs
+log_dir: <absolute path to log directory>
+
+# ---------------------------------------------------------------------------
+# Optional
+# ---------------------------------------------------------------------------
+
+# Path to a plain-text file containing the license header to prepend to
+# new source files. The builder instructs claude to use this header verbatim.
+# Set to null or omit to skip license header injection.
+license_file: <absolute path to LICENSE_HEADER.txt or null>
+
+# Default model when a task's Model: field is absent or unrecognized.
+# Must be one of the keys in the models dict below, or a full model ID.
+default_model: sonnet
+
+# ---------------------------------------------------------------------------
+# Model ID aliases
+# Update these values when new model versions are released.
+# Use the keys "haiku", "sonnet", "opus" in plan Model: fields.
+# ---------------------------------------------------------------------------
+models:
+  haiku:  claude-haiku-4-5-20251001
+  sonnet: claude-sonnet-4-6
+  opus:   claude-opus-4-6
