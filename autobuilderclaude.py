@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.0.0
+# autobuilderclaude v1.1.1
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -33,6 +33,7 @@
 #   --config CONFIG       YAML config file (overrides plan Build Config and --template)
 #   --task N              Run only task N (integer) or "verify"
 #   --model MODEL         Override per-task model (haiku|sonnet|opus or full ID)
+#   --parallel N          Number of tasks to run concurrently (default: 1)
 #   --dry-run             Print prompts without calling claude
 #   --list                List tasks and models, then exit
 #   --help
@@ -42,11 +43,13 @@
 # ---------------------------------------------------------------------------
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -288,17 +291,25 @@ def write_log(log_dir, filename, content):
 # Claude invocation
 # ---------------------------------------------------------------------------
 
-def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None):
+def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, _lines=None):
     """
     Pipe prompt to claude on stdin. Capture stdout+stderr to a log file
     and echo to stdout. Return (exit_code, usage_dict).
     usage_dict keys: input_tokens, output_tokens, cache_read_input_tokens,
     cache_creation_input_tokens. All zero on failure or dry-run.
     add_dirs: list of directory paths to pass via --add-dir.
+    _lines: if a list, append output lines to it instead of printing (for
+            parallel execution -- caller prints the buffer atomically).
     """
+    def _out(s=''):
+        if _lines is not None:
+            _lines.append(s)
+        else:
+            print(s)
+
     ts = datetime.now(timezone.utc).strftime('%H%M%SZ')
     prompt_log = write_log(log_dir, f'{label}_{ts}_prompt.txt', prompt)
-    print(f'  prompt  -> {prompt_log}')
+    _out(f'  prompt  -> {prompt_log}')
 
     _zero_usage = {
         'input_tokens': 0, 'output_tokens': 0,
@@ -306,9 +317,9 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None):
     }
 
     if dry_run:
-        print('-- DRY RUN: prompt follows --')
-        print(prompt)
-        print('-- END prompt --')
+        _out('-- DRY RUN: prompt follows --')
+        _out(prompt)
+        _out('-- END prompt --')
         return 0, _zero_usage
 
     cmd = ['claude', '--model', model, '-p', '--output-format', 'json',
@@ -343,13 +354,32 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None):
     tok_out = usage.get('output_tokens', 0)
     tok_cr  = usage.get('cache_read_input_tokens', 0)
     tok_cw  = usage.get('cache_creation_input_tokens', 0)
-    print(
+    _out(
         f'  output  -> {out_log}  ({elapsed:.1f}s, exit {proc.returncode})'
         f'  tokens: in={tok_in} out={tok_out} cache_read={tok_cr} cache_write={tok_cw}'
     )
-    print(text_output)
+    _out(text_output)
 
     return proc.returncode, usage
+
+
+def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs):
+    """
+    Worker for parallel execution. Buffers all output, returns
+    (task_num, rc, usage, lines) where lines is a list of strings to print.
+    """
+    lines = [
+        '',
+        '=' * 70,
+        f'  Task {task["num"]} -- {task["title"]}',
+        f'  model: {model}',
+    ]
+    if task['files']:
+        lines.append(f'  files: {", ".join(task["files"])}')
+    lines.append('=' * 70)
+
+    rc, usage = run_claude(prompt, model, dry_run, log_dir, label, add_dirs, _lines=lines)
+    return task['num'], rc, usage, lines
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +389,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None):
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.0.0 -- Document-driven Claude task runner (autobuilder format v1).',
+        description='autobuilderclaude v1.1.1 -- Document-driven Claude task runner (autobuilder format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilder_plan_template_v1.md\n'
@@ -373,13 +403,15 @@ def build_arg_parser():
                    help='YAML config file providing base defaults (overridden by plan Build Config)')
     p.add_argument('--config',   metavar='CONFIG',
                    help='YAML config file (overrides plan Build Config and --template)')
-    p.add_argument('--task',    metavar='N',
+    p.add_argument('--task',     metavar='N',
                    help='Run only task N (integer) or "verify"')
-    p.add_argument('--model',   metavar='MODEL',
+    p.add_argument('--model',    metavar='MODEL',
                    help='Override per-task model (haiku|sonnet|opus or full ID)')
-    p.add_argument('--dry-run', action='store_true',
+    p.add_argument('--parallel', metavar='N', type=int, default=1,
+                   help='Number of tasks to run concurrently (default: 1)')
+    p.add_argument('--dry-run',  action='store_true',
                    help='Print prompts without calling claude')
-    p.add_argument('--list',    action='store_true',
+    p.add_argument('--list',     action='store_true',
                    help='List tasks with resolved models, then exit')
     return p
 
@@ -391,6 +423,10 @@ def build_arg_parser():
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    if args.parallel < 1:
+        print('ERROR: --parallel must be >= 1', file=sys.stderr)
+        sys.exit(1)
 
     plan_path = args.input
     try:
@@ -450,43 +486,74 @@ def main():
                 )
                 sys.exit(1)
     else:
-        selected  = tasks
+        selected   = tasks
         run_verify = verification is not None
 
     run_ts   = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H%MZ')
     log_dir  = make_run_log_dir(config, plan_path, run_ts)
     add_dirs = [d for d in [config.get('repo', '').strip()] if d]
     print(f'Log dir: {log_dir}')
+    if args.parallel > 1:
+        print(f'Parallel: {args.parallel} workers')
 
     default_model = config.get('default_model', 'sonnet')
-    exit_code = 0
+    exit_code  = 0
     total_usage = {
         'input_tokens': 0, 'output_tokens': 0,
         'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0,
     }
+    print_lock = threading.Lock()
 
-    for task in selected:
-        model_key = args.model or task['model'] or default_model
-        model     = resolve_model(model_key, config)
-        # Label for log filenames: task_001_short-title
-        safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
-        label = f'task_{task["num"]:03d}_{safe_title}'
-
-        print()
-        print('=' * 70)
-        print(f'  Task {task["num"]} -- {task["title"]}')
-        print(f'  model: {model}')
-        if task['files']:
-            print(f'  files: {", ".join(task["files"])}')
-        print('=' * 70)
-
-        prompt = build_prompt(task, config)
-        rc, usage = run_claude(prompt, model, args.dry_run, log_dir, label, add_dirs)
+    def _accumulate(rc, usage, task_num=None):
+        nonlocal exit_code
         for k in total_usage:
             total_usage[k] += usage.get(k, 0)
         if rc != 0:
-            print(f'WARNING: task {task["num"]} exited {rc}', file=sys.stderr)
+            label = f'task {task_num}' if task_num is not None else 'verification'
+            print(f'WARNING: {label} exited {rc}', file=sys.stderr)
             exit_code = rc
+
+    if args.parallel > 1 and len(selected) > 1:
+        # Build all (task, model, prompt, label) tuples up front.
+        work_items = []
+        for task in selected:
+            model_key = args.model or task['model'] or default_model
+            model     = resolve_model(model_key, config)
+            safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
+            label      = f'task_{task["num"]:03d}_{safe_title}'
+            prompt     = build_prompt(task, config)
+            work_items.append((task, model, prompt, label))
+
+        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            futures = {
+                executor.submit(
+                    _task_worker, task, model, prompt, args.dry_run, log_dir, label, add_dirs
+                ): task['num']
+                for task, model, prompt, label in work_items
+            }
+            for future in as_completed(futures):
+                task_num, rc, usage, lines = future.result()
+                with print_lock:
+                    print('\n'.join(lines))
+                _accumulate(rc, usage, task_num)
+    else:
+        for task in selected:
+            model_key = args.model or task['model'] or default_model
+            model     = resolve_model(model_key, config)
+            safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
+            label      = f'task_{task["num"]:03d}_{safe_title}'
+
+            print()
+            print('=' * 70)
+            print(f'  Task {task["num"]} -- {task["title"]}')
+            print(f'  model: {model}')
+            if task['files']:
+                print(f'  files: {", ".join(task["files"])}')
+            print('=' * 70)
+
+            prompt = build_prompt(task, config)
+            rc, usage = run_claude(prompt, model, args.dry_run, log_dir, label, add_dirs)
+            _accumulate(rc, usage, task['num'])
 
     if run_verify and verification:
         model_key = args.model or verification['model']
@@ -500,11 +567,7 @@ def main():
 
         prompt = build_prompt(verification, config)
         rc, usage = run_claude(prompt, model, args.dry_run, log_dir, 'verify', add_dirs)
-        for k in total_usage:
-            total_usage[k] += usage.get(k, 0)
-        if rc != 0:
-            print(f'WARNING: verification exited {rc}', file=sys.stderr)
-            exit_code = rc
+        _accumulate(rc, usage)
 
     print()
     print(

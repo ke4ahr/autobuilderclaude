@@ -6,8 +6,9 @@ https://github.com/ke4ahr/autobuilderclaude
 
 Reads an implementation plan written in Markdown, extracts tasks, and
 executes each one by piping the task prompt to `claude` via the CLI.
-All prompts and responses are captured to timestamped log files.
-Token usage is reported per task and as a run total.
+Tasks may run sequentially or concurrently. All prompts and responses
+are captured to timestamped log files. Token usage is reported per task
+and as a run total.
 
 ## Requirements
 
@@ -58,6 +59,7 @@ autobuilderclaude --input PLAN [--template TEMPLATE] [--config CONFIG] [OPTIONS]
 | `--config CONFIG` | YAML file overriding both the template and the plan's Build Config |
 | `--task N` | Run only task N (integer) or `verify` |
 | `--model MODEL` | Override per-task model for all tasks (`haiku`, `sonnet`, `opus`, or full model ID) |
+| `--parallel N` | Number of tasks to run concurrently (default: 1) |
 | `--dry-run` | Print resolved prompts without calling claude |
 | `--list` | List all tasks with resolved models, then exit |
 
@@ -97,8 +99,11 @@ Files: lib/db.py
 Prompt text here. Describe exactly what claude should create or modify.
 ```
 
-Tasks are executed in numeric order. The optional `## Verification`
-section runs after all tasks (or alone with `--task verify`).
+Tasks are executed in numeric order when sequential. With `--parallel`,
+tasks are dispatched concurrently and may complete out of order; each
+task's output is buffered and printed as a complete block when it
+finishes. The optional `## Verification` section always runs after all
+tasks complete.
 
 ### Task fields
 
@@ -123,7 +128,7 @@ models:
   opus:   claude-opus-4-6
 ```
 
-`autobuilder_config_v1.yaml` is a template with placeholder values.
+`docs/autobuilder_config_v1.yaml` is a template with placeholder values.
 Copy it, fill in real paths, and pass it via `--template` or `--config`.
 
 ### Config keys
@@ -147,6 +152,19 @@ claude --model MODEL -p --output-format json --allowedTools Edit Write --add-dir
 `--allowedTools Edit Write` permits claude to write files without
 interactive permission prompts. `--add-dir REPO` grants file access to
 the repo directory. JSON output format is used to capture token usage.
+
+## Parallel execution
+
+`--parallel N` runs up to N tasks concurrently using a thread pool.
+Each task gets its own log files. Output is buffered per task and
+printed as a complete block when the task finishes, so blocks do not
+interleave.
+
+The verification step always runs sequentially after all tasks complete,
+regardless of `--parallel`.
+
+Use `--parallel` for independent tasks (e.g. separate library files).
+Avoid it for tasks with ordering dependencies.
 
 ## Token usage
 
@@ -191,7 +209,13 @@ autobuilderclaude --input docs/plan.md --task 1
 Run all tasks with a shared template for defaults:
 
 ```
-autobuilderclaude --input docs/plan.md --template autobuilder_config_v1.yaml
+autobuilderclaude --input docs/plan.md --template docs/autobuilder_config_v1.yaml
+```
+
+Run tasks 1-5 concurrently (3 at a time):
+
+```
+autobuilderclaude --input docs/plan.md --parallel 3
 ```
 
 Dry-run to preview all prompts:
@@ -218,5 +242,6 @@ Override model for a one-off test:
 autobuilderclaude --input docs/plan.md --task 3 --model sonnet
 ```
 
-Copyright (C) 2026 Kris Kirby, KE4AHR
-This file is distributed under the GPLv3.0. 
+Copyright (C) 2026 Kris Kirby
+
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
