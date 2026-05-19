@@ -59,11 +59,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
     Appear immediately after the ### Task heading, one per line, no blank lines
     between them.
     Required:
-      Model: haiku | sonnet | opus
+      Model: haiku | sonnet | opus | <full-model-id>
     Optional:
       Files: path/relative/to/repo [, path2, path3]
     "haiku", "sonnet", "opus" resolve via models aliases in Build Config or
-    config file. A command-line --model flag overrides the per-task field.
+    config file. A full model ID (e.g. nvidia/nemotron-3-super-120b-a12b:free)
+    is passed directly to the claude CLI. OpenRouter models require
+    ANTHROPIC_BASE_URL=https://openrouter.ai/api and ANTHROPIC_AUTH_TOKEN set
+    in the environment. A command-line --model flag overrides the per-task field.
 
   PROMPT BODY
     Everything after the blank line that follows the per-task fields,
@@ -71,6 +74,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
     is the prompt body sent to claude.
     The builder prepends:
       - "Working directory: {repo}"          (if repo is set)
+      - preamble text                        (if preamble is set in config)
       - License header block                 (if license_file is set)
     The builder appends nothing -- the plan author controls the ending.
     Convention: end every prompt body with "Confirm when done."
@@ -100,10 +104,16 @@ repo:          /absolute/path/to/project/root
 log_dir:       /absolute/path/to/tmp_build_logs
 license_file:  /absolute/path/to/LICENSE_HEADER.txt
 default_model: sonnet
+# models_file: load additional model IDs from a plain-text file (one per line).
+# Each ID becomes a self-mapping alias usable in task Model: fields.
+# Requires ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN for OpenRouter models.
+# models_file: /absolute/path/to/models.txt
 models:
   haiku:  claude-haiku-4-5-20251001
   sonnet: claude-sonnet-4-6
   opus:   claude-opus-4-6
+  # Short alias example for an OpenRouter model:
+  # nemotron: nvidia/nemotron-3-super-120b-a12b:free
 ```
 
 ## Overview

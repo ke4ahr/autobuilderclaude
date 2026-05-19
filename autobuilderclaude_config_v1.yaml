@@ -47,21 +47,55 @@ log_dir: <absolute path to log directory>
 # Optional
 # ---------------------------------------------------------------------------
 
+# Additional directories to grant claude read/write access via --add-dir.
+# Use when tasks must access files outside the repo directory (e.g. a
+# shared project memory directory). Each entry is passed as a separate
+# --add-dir flag. Omit or set to [] if not needed.
+add_dirs: []
+#  - /absolute/path/to/extra/dir
+
 # Path to a plain-text file containing the license header to prepend to
 # new source files. The builder instructs claude to use this header verbatim.
 # Set to null or omit to skip license header injection.
 license_file: <absolute path to LICENSE_HEADER.txt or null>
+
+# Text injected into every task prompt after "Working directory:" and before
+# the task body. Use to set agent behavior that applies to all tasks.
+# Common use: instruct the agent to complete all steps without asking questions.
+# Set to "" or omit to skip.
+preamble: |
+  Complete ALL steps in this task without asking for confirmation.
+  Do not stop mid-task to ask "Continue?" or "Shall I proceed?".
+  Apply all renames, writes, and changes as directed. Report results when done.
 
 # Default model when a task's Model: field is absent or unrecognized.
 # Must be one of the keys in the models dict below, or a full model ID.
 default_model: sonnet
 
 # ---------------------------------------------------------------------------
+# Additional models file (optional)
+# Path to a plain-text file with one model ID per line (blank lines and
+# lines starting with '#' are ignored). Each ID is registered as a
+# self-mapping alias so it can be used verbatim in plan Model: fields.
+# Useful for OpenRouter models routed via ANTHROPIC_BASE_URL:
+#   e.g. ANTHROPIC_BASE_URL=https://openrouter.ai/api
+#        ANTHROPIC_AUTH_TOKEN=<your OpenRouter key>
+# Explicit entries in the models dict below override any entry from this file.
+# Set to null or omit to skip.
+models_file: null
+#models_file: /absolute/path/to/models.txt
+
+# ---------------------------------------------------------------------------
 # Model ID aliases
 # Update these values when new model versions are released.
 # Use the keys "haiku", "sonnet", "opus" in plan Model: fields.
+# Full provider/model IDs (e.g. nvidia/nemotron-3-super-120b-a12b:free) may
+# also be used directly in plan Model: fields without defining an alias here.
 # ---------------------------------------------------------------------------
 models:
   haiku:  claude-haiku-4-5-20251001
   sonnet: claude-sonnet-4-6
   opus:   claude-opus-4-6
+  # Example short aliases for OpenRouter models:
+  # nemotron: nvidia/nemotron-3-super-120b-a12b:free
+  # qwen3:    qwen/qwen3-coder:free

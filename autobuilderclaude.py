@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.1.1
+# autobuilderclaude v1.2.0
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -45,7 +45,6 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-import os
 import re
 import subprocess
 import sys
@@ -66,8 +65,20 @@ except ImportError:
 DEFAULT_MODEL_IDS = {
     'haiku':  'claude-haiku-4-5-20251001',
     'sonnet': 'claude-sonnet-4-6',
-    'opus':   'claude-opus-4-6',
+    'opus':   'claude-opus-4-7',
 }
+
+# ---------------------------------------------------------------------------
+# Rate-limit detection
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_RE = re.compile(r'hit your limit', re.IGNORECASE)
+
+
+class RateLimitError(RuntimeError):
+    """Raised when the claude CLI output indicates a usage-rate limit."""
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Config loading and merging
@@ -102,6 +113,28 @@ def load_config_file(path):
     _require_yaml()
     with open(path, encoding='utf-8') as f:
         return yaml.safe_load(f) or {}
+
+
+def load_models_file(path):
+    """
+    Read a models list file (one model ID per line).
+    Blank lines and lines starting with '#' are ignored.
+    Returns a dict mapping each model ID to itself (self-mapping aliases).
+    These entries can be used in plan Model: fields as full IDs and are
+    treated the same as any explicit alias in the models dict.
+    """
+    result = {}
+    try:
+        text = Path(path).read_text(encoding='utf-8')
+    except OSError as e:
+        print(f'WARNING: cannot read models_file {path}: {e}', file=sys.stderr)
+        return result
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        result[line] = line
+    return result
 
 
 def merge_configs(plan_cfg, file_cfg):
@@ -242,14 +275,18 @@ def parse_verification(plan_text):
 
 def build_prompt(task_dict, config):
     """
-    Prepend repo path and optional license header to the task's prompt body.
-    Kept minimal to avoid unnecessary context overhead.
+    Prepend repo path, optional preamble, and optional license header to the
+    task's prompt body. Kept minimal to avoid unnecessary context overhead.
     """
     parts = []
 
     repo = config.get('repo', '').strip()
     if repo:
         parts.append(f'Working directory: {repo}')
+
+    preamble = config.get('preamble', '').strip()
+    if preamble:
+        parts.append(preamble)
 
     license_file = config.get('license_file', '')
     if license_file and str(license_file).lower() not in ('null', 'none', ''):
@@ -287,11 +324,29 @@ def write_log(log_dir, filename, content):
     return p
 
 
+def write_completion_marker(log_dir, task_num, task_title, exit_code):
+    """Write a marker file for a finished task.
+
+    Filename ends with _completed.txt on exit 0, _failed.txt otherwise.
+    """
+    ts       = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
+    date_str = ts[:10]
+    status   = 'completed' if exit_code == 0 else 'failed'
+    filename = f'task_{task_num}_{date_str}_{status}.txt'
+    content = (
+        f'task: {task_num}\n'
+        f'title: {task_title}\n'
+        f'timestamp: {ts}\n'
+        f'exit_code: {exit_code}\n'
+    )
+    return write_log(log_dir, filename, content)
+
+
 # ---------------------------------------------------------------------------
 # Claude invocation
 # ---------------------------------------------------------------------------
 
-def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, _lines=None):
+def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_tools=None, _lines=None):
     """
     Pipe prompt to claude on stdin. Capture stdout+stderr to a log file
     and echo to stdout. Return (exit_code, usage_dict).
@@ -300,6 +355,8 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, _lines=Non
     add_dirs: list of directory paths to pass via --add-dir.
     _lines: if a list, append output lines to it instead of printing (for
             parallel execution -- caller prints the buffer atomically).
+    Raises RateLimitError if claude exits non-zero and the output contains
+    a usage-rate-limit message.
     """
     def _out(s=''):
         if _lines is not None:
@@ -307,7 +364,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, _lines=Non
         else:
             print(s)
 
-    ts = datetime.now(timezone.utc).strftime('%H%M%SZ')
+    ts = datetime.now(timezone.utc).strftime('%H:%M:%S+00:00')
     prompt_log = write_log(log_dir, f'{label}_{ts}_prompt.txt', prompt)
     _out(f'  prompt  -> {prompt_log}')
 
@@ -322,8 +379,9 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, _lines=Non
         _out('-- END prompt --')
         return 0, _zero_usage
 
+    tools = allowed_tools or ['Bash', 'Edit', 'Read', 'Write', 'mcp__GhidraMCP__*']
     cmd = ['claude', '--model', model, '-p', '--output-format', 'json',
-           '--allowedTools', 'Edit', 'Write']
+           '--allowedTools'] + tools
     for d in (add_dirs or []):
         cmd += ['--add-dir', d]
     t0 = time.monotonic()
@@ -360,10 +418,13 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, _lines=Non
     )
     _out(text_output)
 
+    if proc.returncode != 0 and _RATE_LIMIT_RE.search(raw):
+        raise RateLimitError(text_output.strip()[:300])
+
     return proc.returncode, usage
 
 
-def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs):
+def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed_tools=None):
     """
     Worker for parallel execution. Buffers all output, returns
     (task_num, rc, usage, lines) where lines is a list of strings to print.
@@ -378,7 +439,9 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs):
         lines.append(f'  files: {", ".join(task["files"])}')
     lines.append('=' * 70)
 
-    rc, usage = run_claude(prompt, model, dry_run, log_dir, label, add_dirs, _lines=lines)
+    rc, usage = run_claude(prompt, model, dry_run, log_dir, label, add_dirs, allowed_tools, _lines=lines)
+    marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
+    lines.append(f'  marker  -> {marker}')
     return task['num'], rc, usage, lines
 
 
@@ -389,7 +452,7 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs):
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.1.1 -- Document-driven Claude task runner (autobuilder format v1).',
+        description='autobuilderclaude v1.2.0 -- Document-driven Claude task runner (autobuilder format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilder_plan_template_v1.md\n'
@@ -406,7 +469,7 @@ def build_arg_parser():
     p.add_argument('--task',     metavar='N',
                    help='Run only task N (integer) or "verify"')
     p.add_argument('--model',    metavar='MODEL',
-                   help='Override per-task model (haiku|sonnet|opus or full ID)')
+                   help='Override per-task model (haiku|sonnet|opus, a full Claude model ID, or a provider/model:tag ID such as nvidia/nemotron-3-super-120b-a12b:free)')
     p.add_argument('--parallel', metavar='N', type=int, default=1,
                    help='Number of tasks to run concurrently (default: 1)')
     p.add_argument('--dry-run',  action='store_true',
@@ -442,6 +505,16 @@ def main():
     config = merge_configs(config, load_plan_config(plan_text))
     if args.config:
         config = merge_configs(config, load_config_file(args.config))
+
+    # Load models_file if specified: self-map each model ID as an alias.
+    # Explicit models: entries in config take precedence over models_file entries.
+    models_file_path = str(config.get('models_file', '') or '').strip()
+    if models_file_path and models_file_path.lower() not in ('null', 'none', ''):
+        file_models = load_models_file(models_file_path)
+        explicit_models = config.get('models', {})
+        merged_models = dict(file_models)
+        merged_models.update(explicit_models)
+        config['models'] = merged_models
 
     tasks        = parse_tasks(plan_text)
     verification = parse_verification(plan_text)
@@ -489,9 +562,11 @@ def main():
         selected   = tasks
         run_verify = verification is not None
 
-    run_ts   = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H%MZ')
+    run_ts   = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
     log_dir  = make_run_log_dir(config, plan_path, run_ts)
-    add_dirs = [d for d in [config.get('repo', '').strip()] if d]
+    _extra_dirs = config.get('add_dirs') or []
+    add_dirs = [d for d in ([config.get('repo', '').strip()] + list(_extra_dirs)) if d]
+    allowed_tools_list = config.get('allowed_tools') or ['Edit', 'Write']
     print(f'Log dir: {log_dir}')
     if args.parallel > 1:
         print(f'Parallel: {args.parallel} workers')
@@ -527,12 +602,19 @@ def main():
         with ThreadPoolExecutor(max_workers=args.parallel) as executor:
             futures = {
                 executor.submit(
-                    _task_worker, task, model, prompt, args.dry_run, log_dir, label, add_dirs
+                    _task_worker, task, model, prompt, args.dry_run, log_dir, label, add_dirs, allowed_tools_list
                 ): task['num']
                 for task, model, prompt, label in work_items
             }
             for future in as_completed(futures):
-                task_num, rc, usage, lines = future.result()
+                try:
+                    task_num, rc, usage, lines = future.result()
+                except RateLimitError as e:
+                    with print_lock:
+                        print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
+                        print('Remaining tasks skipped.', file=sys.stderr)
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    sys.exit(1)
                 with print_lock:
                     print('\n'.join(lines))
                 _accumulate(rc, usage, task_num)
@@ -552,7 +634,14 @@ def main():
             print('=' * 70)
 
             prompt = build_prompt(task, config)
-            rc, usage = run_claude(prompt, model, args.dry_run, log_dir, label, add_dirs)
+            try:
+                rc, usage = run_claude(prompt, model, args.dry_run, log_dir, label, add_dirs, allowed_tools_list)
+            except RateLimitError as e:
+                print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
+                print('Remaining tasks skipped.', file=sys.stderr)
+                sys.exit(1)
+            marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
+            print(f'  marker  -> {marker}')
             _accumulate(rc, usage, task['num'])
 
     if run_verify and verification:
@@ -566,7 +655,11 @@ def main():
         print('=' * 70)
 
         prompt = build_prompt(verification, config)
-        rc, usage = run_claude(prompt, model, args.dry_run, log_dir, 'verify', add_dirs)
+        try:
+            rc, usage = run_claude(prompt, model, args.dry_run, log_dir, 'verify', add_dirs, allowed_tools_list)
+        except RateLimitError as e:
+            print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
+            sys.exit(1)
         _accumulate(rc, usage)
 
     print()
