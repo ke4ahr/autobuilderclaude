@@ -1,6 +1,6 @@
 # autobuilderclaude
 
-Document-driven Claude task runner (autobuilder format v1).
+Document-driven Claude task runner (autobuilderclaude format v1).
 
 https://github.com/ke4ahr/autobuilderclaude
 
@@ -8,7 +8,10 @@ Reads an implementation plan written in Markdown, extracts tasks, and
 executes each one by piping the task prompt to `claude` via the CLI.
 Tasks may run sequentially or concurrently. All prompts and responses
 are captured to timestamped log files. Token usage is reported per task
-and as a run total.
+and as a run total. Each task is timed; elapsed time is printed in both
+seconds and minutes forms (e.g. `426.7s, 7m6.700s`). On a 429/rate-limit
+response that contains a reset time, the script sleeps until (reset_time
++ 10 minutes) and retries the failing task automatically.
 
 ## Requirements
 
@@ -58,6 +61,7 @@ autobuilderclaude --input PLAN [--template TEMPLATE] [--config CONFIG] [OPTIONS]
 | `--template TEMPLATE` | YAML file providing base defaults; overridden by the plan's Build Config |
 | `--config CONFIG` | YAML file overriding both the template and the plan's Build Config |
 | `--task N` | Run only task N (integer) or `verify` |
+| `--start-task N` | Start at task N and run through all remaining tasks |
 | `--model MODEL` | Override per-task model for all tasks (`haiku`, `sonnet`, `opus`, or full model ID) |
 | `--parallel N` | Number of tasks to run concurrently (default: 1) |
 | `--dry-run` | Print resolved prompts without calling claude |
@@ -176,10 +180,12 @@ Avoid it for tasks with ordering dependencies.
 
 ## Token usage
 
-Token counts are printed after each task on the output line:
+Token counts are printed after each task on the output line, followed by a
+dedicated output-token line:
 
 ```
   output  -> /path/to/1997-07-16T19:20:30+00:00_output.txt  (4.2s, exit 0)  tokens: in=1234 out=567 cache_read=890 cache_write=0
+  output tokens: 567
 ```
 
 A cumulative total is printed at the end of the run:
@@ -193,16 +199,29 @@ read from prompt cache, `cache_write` = tokens written to prompt cache.
 
 ## Rate-limit handling
 
-If claude exits non-zero and its output contains a usage-rate-limit message
-(`"hit your limit"`), the run aborts immediately with:
+When claude exits non-zero and its output contains a usage-rate-limit message,
+the script attempts to extract a reset time from the message. Three formats are
+recognized: ISO 8601 (e.g. `2026-05-22T14:00:00Z`), 12-hour clock with TZ
+abbreviation (e.g. `9:00 PM CDT on Thursday, May 22, 2026`), and relative
+offsets (e.g. `retry after 60 seconds`).
+
+If a reset time is found, the script sleeps until (reset_time + 10 minutes)
+and then retries the failing task automatically:
+
+```
+  Rate limit -- resets 2026-05-22T14:00:00+00:00; sleeping 3612s (wake 2026-05-22T15:00:12+00:00)
+  Retrying ...
+```
+
+If the retry succeeds, processing continues with the next task normally.
+
+If no reset time is found in the message, or if the retry also hits a rate
+limit, the run aborts immediately:
 
 ```
 ERROR: rate limit reached -- <message excerpt>
 Remaining tasks skipped.
 ```
-
-No further tasks are dispatched. The reset time is included in the message
-excerpt taken directly from the claude CLI output.
 
 ## Log files
 
@@ -344,3 +363,97 @@ SPDX-License-Identifier: GPL-3.0-or-later
   OpenRouter env vars: ANTHROPIC_BASE_URL=https://openrouter.ai/api,
     ANTHROPIC_AUTH_TOKEN=<key>, OPENROUTER_API_KEY=<same key>. ANTHROPIC_API_KEY empty.
   syntorx9000 copy synced: autobuilderclaude.py (already identical), config, plan template.
+
+# line 375
+[2026-05-21T08:02:12+00:00 / 2026-05-21T03:02:12-0500] patch v1.2.x -> v1.3.1
+  autobuilderclaude.py:
+    - Version bump to 1.3.1
+    - Added timedelta to datetime imports
+    - Expanded _RATE_LIMIT_RE to catch "usage limit", "rate limit", "exceeded.*limit"
+    - Added parse_reset_time(message): extracts reset UTC datetime from rate-limit
+      messages; handles ISO 8601, 12-hour clock + TZ abbreviation, relative offsets
+    - Added _RESET_ISO_RE, _RESET_12H_RE, _RESET_RELATIVE_RE, _TZ_OFFSETS, _MONTH_NAMES
+    - run_claude: wraps claude_cmd with bash -c 'time "$@"' -- to use bash time builtin;
+      stderr captured separately (time_raw) instead of merged into stdout
+    - run_claude: prints dedicated "output tokens: N" line after each invocation
+    - run_claude: prints bash time output (real/user/sys) as "time: <line>" entries
+    - run_claude: retry loop on rate-limit: if reset time parseable and attempt==1,
+      sleeps until (reset_dt + 10 min) and retries; raises RateLimitError on second
+      failure or when no reset time is found
+    - run_claude: attempt suffix (_attempt2) appended to output log filename on retry
+  README.md:
+    - Updated description to mention bash time, output tokens, and auto-retry
+    - Added "Bash time output" section
+    - Updated "Rate-limit handling" section to describe sleep-and-retry behavior
+
+# line 397
+[2026-05-21T15:51:32+00:00 / 2026-05-21T10:51:32-0500] fix v1.3.1 -- rate-limit reset time parse failure
+  Root cause: Claude CLI outputs "resets 7:20am (America/Chicago)" -- a time-only
+  string with an IANA timezone name in parens. _RESET_12H_RE requires a full date
+  (month/day/year) and did not match. _RESET_ISO_RE and _RESET_RELATIVE_RE also
+  did not match. parse_reset_time returned None -> RateLimitError raised -> abort.
+  autobuilderclaude.py:
+    - Added zoneinfo import (with ImportError fallback) and _HAVE_ZONEINFO flag
+    - Added _RESET_TIME_IANA_RE: r'(\d{1,2}:\d{2})\s*([ap]m)\s*\(([A-Za-z_/]+)\)'
+    - parse_reset_time: new branch for IANA time-only format; uses ZoneInfo to
+      resolve the named timezone; assumes same day if time is still future, else
+      next day; returns UTC-aware datetime
+    - run_claude: changed combined to text_output + raw + time_raw so the decoded
+      human-readable message (JSON-unescaped) is searched first by parse_reset_time
+
+# line 416
+[2026-05-21T16:05:05+00:00 / 2026-05-21T11:05:05-0500] fix -- limit detection: IANA time pattern is definitive signal
+  Root cause: limit errors are not always 429s; the IANA time pattern
+  ("7:20am (America/Chicago)") is the reliable signal regardless of exit code.
+  autobuilderclaude.py:
+    - run_claude: replaced single `if proc.returncode != 0 and _RATE_LIMIT_RE`
+      check with `is_limit` flag: _RESET_TIME_IANA_RE match triggers regardless
+      of exit code; _RATE_LIMIT_RE remains fallback requiring non-zero exit
+
+# line 415
+[2026-05-21T16:12:46+00:00 / 2026-05-21T11:12:46-0500] Remove bash time wrapper
+  autobuilderclaude.py:
+    - Removed bash time wrapper (`bash -c 'time "$@"'`); cmd set directly to claude_cmd
+    - stderr still captured separately (renamed time_raw -> err); included in combined
+      for rate-limit pattern detection
+    - Removed time printing block (real/user/sys lines)
+    - Updated header comment and run_claude docstring
+  README.md:
+    - Removed "Bash time output" section
+    - Added this activity log entry
+
+# line 427
+[2026-05-21T16:23:30+00:00 / 2026-05-21T11:23:30-0500] Elapsed time format change
+  autobuilderclaude.py:
+    - run_claude output line now shows both formats: (426.7s, 7m6.700s, exit 0)
+    - Seconds form retained for quick scan; minutes form added for readability
+
+# line 432
+[2026-05-21T16:26:33+00:00 / 2026-05-21T11:26:33-0500] Add --start-task option
+  autobuilderclaude.py:
+    - Added --start-task N argument: runs tasks N through end of plan
+    - Mutually exclusive with --task; errors if no tasks >= N exist
+    - Header usage comment updated
+  README.md:
+    - Added this activity log entry
+
+# line 442
+[2026-05-21T16:28:04+00:00 / 2026-05-21T11:28:04-0500] v1.3.1 -> v1.4.1
+  autobuilderclaude.py:
+    - Version string updated to v1.4.1 (header comment and argparse description)
+  README.md:
+    - Version in intro description corrected (bash time ref removed; elapsed time description updated)
+    - --start-task row added to Options table
+    - Added this activity log entry
+
+# line 451
+[2026-05-21T16:31:10+00:00 / 2026-05-21T11:31:10-0500] Rename legacy autobuilder -> autobuilderclaude format refs
+  autobuilderclaude.py:
+    - Header: "autobuilder format v1" -> "autobuilderclaude format v1"
+    - Header: plan/config file refs updated to autobuilderclaude_plan_template_v1.md / autobuilderclaude_config_v1.yaml
+    - argparse description and epilog: same format name and file ref updates
+    - Default log dir (tmp_build_logs) left unchanged per user instruction
+  README.md:
+    - Subtitle: "autobuilder format v1" -> "autobuilderclaude format v1"
+    - Historical activity log entries (2026-04-15) left unchanged -- accurately reflect legacy tool names
+    - Added this activity log entry

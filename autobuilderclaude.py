@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.2.0
+# autobuilderclaude v1.4.1
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -20,9 +20,13 @@
 # ---------------------------------------------------------------------------
 # autobuilderclaude -- Document-driven Claude task runner (format v1).
 #
-# Parses an implementation plan (autobuilder format v1) and executes tasks
+# Parses an implementation plan (autobuilderclaude format v1) and executes tasks
 # via the claude CLI. Per-task model is read from the plan document.
 # All I/O to and from claude is captured to timestamped log files.
+# Output token count is printed as a dedicated line per task.
+# On a 429/rate-limit response that contains a
+# reset time, the script sleeps until (reset_time + 10 minutes) and retries
+# the failing task automatically before resuming normal processing.
 #
 # Usage:
 #   autobuilderclaude --input PLAN [--template TEMPLATE] [--config CONFIG] [OPTIONS]
@@ -32,14 +36,15 @@
 #   --template TEMPLATE   YAML base defaults (overridden by plan Build Config)
 #   --config CONFIG       YAML config file (overrides plan Build Config and --template)
 #   --task N              Run only task N (integer) or "verify"
+#   --start-task N        Start at task N and run through the remaining tasks
 #   --model MODEL         Override per-task model (haiku|sonnet|opus or full ID)
 #   --parallel N          Number of tasks to run concurrently (default: 1)
 #   --dry-run             Print prompts without calling claude
 #   --list                List tasks and models, then exit
 #   --help
 #
-# Plan format: see autobuilder_plan_template_v1.md
-# Config format: see autobuilder_config_v1.yaml
+# Plan format: see autobuilderclaude_plan_template_v1.md
+# Config format: see autobuilderclaude_config_v1.yaml
 # ---------------------------------------------------------------------------
 
 import argparse
@@ -50,8 +55,16 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError as _ZINotFoundError
+    _HAVE_ZONEINFO = True
+except ImportError:
+    _HAVE_ZONEINFO = False
+    ZoneInfo = None
+    _ZINotFoundError = Exception
 
 try:
     import yaml
@@ -69,15 +82,145 @@ DEFAULT_MODEL_IDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Rate-limit detection
+# Rate-limit detection and retry
 # ---------------------------------------------------------------------------
 
-_RATE_LIMIT_RE = re.compile(r'hit your limit', re.IGNORECASE)
+_RATE_LIMIT_RE = re.compile(
+    r'hit your limit|usage limit|rate.?limit|exceeded.*limit|limit.*exceeded',
+    re.IGNORECASE,
+)
+
+# Patterns for extracting the reset datetime from rate-limit messages.
+_RESET_ISO_RE = re.compile(
+    r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})?)',
+)
+_RESET_12H_RE = re.compile(
+    r'(\d{1,2}:\d{2}(?::\d{2})?)\s*([AP]M)\s*([A-Z]{2,4})?'
+    r'(?:\s+on\s+\w+,?\s+(\w+)\s+(\d{1,2}),?\s+(\d{4}))?',
+    re.IGNORECASE,
+)
+_RESET_RELATIVE_RE = re.compile(
+    r'(?:reset|retry|wait)\s+(?:in|after)\s+(\d+)\s*(second|minute|hour)s?',
+    re.IGNORECASE,
+)
+# "7:20am (America/Chicago)" -- time-only with IANA zone in parens
+_RESET_TIME_IANA_RE = re.compile(
+    r'(\d{1,2}:\d{2})\s*([ap]m)\s*\(([A-Za-z_/]+)\)',
+    re.IGNORECASE,
+)
+
+_TZ_OFFSETS = {
+    'UTC': 0, 'GMT': 0,
+    'EST': -5, 'EDT': -4,
+    'CST': -6, 'CDT': -5,
+    'MST': -7, 'MDT': -6,
+    'PST': -8, 'PDT': -7,
+}
+_MONTH_NAMES = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4,
+    'may': 5, 'june': 6, 'july': 7, 'august': 8,
+    'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
+    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
 
 
 class RateLimitError(RuntimeError):
     """Raised when the claude CLI output indicates a usage-rate limit."""
     pass
+
+
+def parse_reset_time(message):
+    """
+    Extract the rate-limit reset datetime from a message string.
+    Returns a UTC-aware datetime, or None if no parseable time is found.
+    Handles ISO 8601, 12-hour clock with TZ abbreviation, and relative offsets.
+    """
+    # ISO 8601: 2026-05-22T14:00:00Z or 2026-05-22T14:00:00-05:00
+    m = _RESET_ISO_RE.search(message)
+    if m:
+        s = m.group(1)
+        base = s[:19].replace('T', ' ')
+        try:
+            dt = datetime.strptime(base, '%Y-%m-%d %H:%M:%S')
+            if s.endswith('Z'):
+                return dt.replace(tzinfo=timezone.utc)
+            off_m = re.search(r'([+-])(\d{2}):?(\d{2})$', s)
+            if off_m:
+                sign = 1 if off_m.group(1) == '+' else -1
+                h, mn = int(off_m.group(2)), int(off_m.group(3))
+                tz = timezone(timedelta(hours=sign * h, minutes=sign * mn))
+                return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    # "9:00 PM CDT on Thursday, May 22, 2026"
+    m = _RESET_12H_RE.search(message)
+    if m:
+        time_str   = m.group(1)
+        ampm       = m.group(2).upper()
+        tz_abbr    = (m.group(3) or 'UTC').upper()
+        month_str  = m.group(4)
+        day_str    = m.group(5)
+        year_str   = m.group(6)
+        if month_str and day_str and year_str:
+            month = _MONTH_NAMES.get(month_str.lower())
+            if month:
+                try:
+                    parts = time_str.split(':')
+                    h  = int(parts[0])
+                    mn = int(parts[1]) if len(parts) > 1 else 0
+                    sc = int(parts[2]) if len(parts) > 2 else 0
+                    if ampm == 'PM' and h != 12:
+                        h += 12
+                    elif ampm == 'AM' and h == 12:
+                        h = 0
+                    dt = datetime(int(year_str), month, int(day_str), h, mn, sc)
+                    offset_h = _TZ_OFFSETS.get(tz_abbr, 0)
+                    tz = timezone(timedelta(hours=offset_h))
+                    return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+                except (ValueError, KeyError):
+                    pass
+
+    # "retry after 60 seconds" / "reset in 5 minutes"
+    m = _RESET_RELATIVE_RE.search(message)
+    if m:
+        amount = int(m.group(1))
+        unit   = m.group(2).lower()
+        if unit.startswith('second'):
+            delta = timedelta(seconds=amount)
+        elif unit.startswith('minute'):
+            delta = timedelta(minutes=amount)
+        else:
+            delta = timedelta(hours=amount)
+        return datetime.now(timezone.utc) + delta
+
+    # "7:20am (America/Chicago)" -- time-only with IANA zone name
+    if _HAVE_ZONEINFO:
+        m = _RESET_TIME_IANA_RE.search(message)
+        if m:
+            time_str  = m.group(1)
+            ampm      = m.group(2).upper()
+            iana_zone = m.group(3)
+            try:
+                tz = ZoneInfo(iana_zone)
+                parts = time_str.split(':')
+                h  = int(parts[0])
+                mn = int(parts[1])
+                if ampm == 'PM' and h != 12:
+                    h += 12
+                elif ampm == 'AM' and h == 12:
+                    h = 0
+                now_local   = datetime.now(tz)
+                reset_local = now_local.replace(hour=h, minute=mn, second=0, microsecond=0)
+                if reset_local <= now_local:
+                    reset_local += timedelta(days=1)
+                return reset_local.astimezone(timezone.utc)
+            except _ZINotFoundError:
+                pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -348,15 +491,17 @@ def write_completion_marker(log_dir, task_num, task_title, exit_code):
 
 def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_tools=None, _lines=None):
     """
-    Pipe prompt to claude on stdin. Capture stdout+stderr to a log file
-    and echo to stdout. Return (exit_code, usage_dict).
+    Pipe prompt to claude on stdin. Capture stdout+stderr to log files
+    and echo to the terminal. Return (exit_code, usage_dict).
     usage_dict keys: input_tokens, output_tokens, cache_read_input_tokens,
     cache_creation_input_tokens. All zero on failure or dry-run.
     add_dirs: list of directory paths to pass via --add-dir.
     _lines: if a list, append output lines to it instead of printing (for
             parallel execution -- caller prints the buffer atomically).
-    Raises RateLimitError if claude exits non-zero and the output contains
-    a usage-rate-limit message.
+    Output token count is printed as a dedicated line. On a 429/rate-limit
+    response that includes a reset time, sleeps until (reset_time + 10
+    minutes) and retries once. Raises RateLimitError if rate-limited with
+    no parseable reset time or if the retry also fails.
     """
     def _out(s=''):
         if _lines is not None:
@@ -380,46 +525,79 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         return 0, _zero_usage
 
     tools = allowed_tools or ['Bash', 'Edit', 'Read', 'Write', 'mcp__GhidraMCP__*']
-    cmd = ['claude', '--model', model, '-p', '--output-format', 'json',
-           '--allowedTools'] + tools
+    claude_cmd = ['claude', '--model', model, '-p', '--output-format', 'json',
+                  '--allowedTools'] + tools
     for d in (add_dirs or []):
-        cmd += ['--add-dir', d]
-    t0 = time.monotonic()
+        claude_cmd += ['--add-dir', d]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding='utf-8',
-    )
-    raw, _ = proc.communicate(input=prompt)
-    elapsed = time.monotonic() - t0
+    cmd = claude_cmd
 
-    # Parse JSON response; fall back to raw text on failure.
-    usage = dict(_zero_usage)
-    text_output = raw
-    try:
-        data = json.loads(raw)
-        text_output = data.get('result', raw)
-        usage.update(data.get('usage') or {})
-    except (json.JSONDecodeError, AttributeError):
-        pass
+    attempt = 0
+    while True:
+        attempt += 1
+        run_ts = datetime.now(timezone.utc).strftime('%H:%M:%S+00:00')
+        t0 = time.monotonic()
 
-    out_log = write_log(log_dir, f'{label}_{ts}_output.txt', text_output)
-    tok_in  = usage.get('input_tokens', 0)
-    tok_out = usage.get('output_tokens', 0)
-    tok_cr  = usage.get('cache_read_input_tokens', 0)
-    tok_cw  = usage.get('cache_creation_input_tokens', 0)
-    _out(
-        f'  output  -> {out_log}  ({elapsed:.1f}s, exit {proc.returncode})'
-        f'  tokens: in={tok_in} out={tok_out} cache_read={tok_cr} cache_write={tok_cw}'
-    )
-    _out(text_output)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+        )
+        raw, err = proc.communicate(input=prompt)
+        elapsed = time.monotonic() - t0
 
-    if proc.returncode != 0 and _RATE_LIMIT_RE.search(raw):
-        raise RateLimitError(text_output.strip()[:300])
+        # Parse JSON response; fall back to raw text on failure.
+        usage = dict(_zero_usage)
+        text_output = raw
+        try:
+            data = json.loads(raw)
+            text_output = data.get('result', raw)
+            usage.update(data.get('usage') or {})
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        attempt_suffix = f'_attempt{attempt}' if attempt > 1 else ''
+        out_log = write_log(log_dir, f'{label}_{run_ts}{attempt_suffix}_output.txt', text_output)
+        tok_in  = usage.get('input_tokens', 0)
+        tok_out = usage.get('output_tokens', 0)
+        tok_cr  = usage.get('cache_read_input_tokens', 0)
+        tok_cw  = usage.get('cache_creation_input_tokens', 0)
+        _out(
+            f'  output  -> {out_log}'
+            f'  ({elapsed:.1f}s, {int(elapsed) // 60}m{elapsed % 60:.3f}s, exit {proc.returncode})'
+            f'  tokens: in={tok_in} out={tok_out} cache_read={tok_cr} cache_write={tok_cw}'
+        )
+        _out(f'  output tokens: {tok_out}')
+        _out(text_output)
+
+        # text_output has the decoded human-readable result (JSON unescaped);
+        # search it first so natural-language time patterns resolve correctly.
+        combined = text_output + '\n' + raw + '\n' + err
+        # IANA time pattern is the definitive limit signal regardless of exit code.
+        # _RATE_LIMIT_RE catches other formats when exit code is non-zero.
+        is_limit = bool(_RESET_TIME_IANA_RE.search(combined)) or \
+                   (proc.returncode != 0 and bool(_RATE_LIMIT_RE.search(combined)))
+        if is_limit:
+            reset_dt = parse_reset_time(combined)
+            if reset_dt is not None and attempt == 1:
+                wake_dt    = reset_dt + timedelta(minutes=10)
+                now_dt     = datetime.now(timezone.utc)
+                sleep_secs = max(0.0, (wake_dt - now_dt).total_seconds())
+                _out(
+                    f'  Rate limit -- resets '
+                    f'{reset_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")}; '
+                    f'sleeping {sleep_secs:.0f}s '
+                    f'(wake {wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")})'
+                )
+                time.sleep(sleep_secs)
+                _out('  Retrying ...')
+                continue
+            raise RateLimitError(text_output.strip()[:300])
+
+        break
 
     return proc.returncode, usage
 
@@ -452,11 +630,11 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.2.0 -- Document-driven Claude task runner (autobuilder format v1).',
+        description='autobuilderclaude v1.4.1 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            'Plan format:   autobuilder_plan_template_v1.md\n'
-            'Config format: autobuilder_config_v1.yaml\n'
+            'Plan format:   autobuilderclaude_plan_template_v1.md\n'
+            'Config format: autobuilderclaude_config_v1.yaml\n'
             'https://github.com/ke4ahr/autobuilderclaude'
         ),
     )
@@ -466,8 +644,10 @@ def build_arg_parser():
                    help='YAML config file providing base defaults (overridden by plan Build Config)')
     p.add_argument('--config',   metavar='CONFIG',
                    help='YAML config file (overrides plan Build Config and --template)')
-    p.add_argument('--task',     metavar='N',
+    p.add_argument('--task',       metavar='N',
                    help='Run only task N (integer) or "verify"')
+    p.add_argument('--start-task', metavar='N', type=int,
+                   help='Start at task N and run through all remaining tasks')
     p.add_argument('--model',    metavar='MODEL',
                    help='Override per-task model (haiku|sonnet|opus, a full Claude model ID, or a provider/model:tag ID such as nvidia/nemotron-3-super-120b-a12b:free)')
     p.add_argument('--parallel', metavar='N', type=int, default=1,
@@ -539,6 +719,10 @@ def main():
         sys.exit(0)
 
     # Determine which tasks to run.
+    if args.task and args.start_task is not None:
+        print('ERROR: --task and --start-task are mutually exclusive', file=sys.stderr)
+        sys.exit(1)
+
     run_verify = False
     if args.task:
         if args.task.lower() == 'verify':
@@ -558,6 +742,17 @@ def main():
                     file=sys.stderr,
                 )
                 sys.exit(1)
+    elif args.start_task is not None:
+        n = args.start_task
+        selected = [t for t in tasks if t['num'] >= n]
+        if not selected:
+            nums = [str(t['num']) for t in tasks]
+            print(
+                f'ERROR: no tasks >= {n}. Available: {", ".join(nums)}',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        run_verify = verification is not None
     else:
         selected   = tasks
         run_verify = verification is not None
