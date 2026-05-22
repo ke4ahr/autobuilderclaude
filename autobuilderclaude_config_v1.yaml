@@ -72,6 +72,10 @@ preamble: |
 # Must be one of the keys in the models dict below, or a full model ID.
 default_model: sonnet
 
+# Effort level passed to claude via --effort (low|medium|high|xhigh|max).
+# Set to null or omit to use claude's default. Command-line --effort overrides this.
+effort: null
+
 # ---------------------------------------------------------------------------
 # Additional models file (optional)
 # Path to a plain-text file with one model ID per line (blank lines and

@@ -50,7 +50,7 @@ pip install pyyaml
 ## Usage
 
 ```
-autobuilderclaude --input PLAN [--template TEMPLATE] [--config CONFIG] [OPTIONS]
+autobuilderclaude.py --input PLAN [--template TEMPLATE] [--config CONFIG] [OPTIONS]
 ```
 
 ### Options
@@ -62,10 +62,14 @@ autobuilderclaude --input PLAN [--template TEMPLATE] [--config CONFIG] [OPTIONS]
 | `--config CONFIG` | YAML file overriding both the template and the plan's Build Config |
 | `--task N` | Run only task N (integer) or `verify` |
 | `--start-task N` | Start at task N and run through all remaining tasks |
+| `--stop-after N` | Stop after task N completes (inclusive); skips verification |
 | `--model MODEL` | Override per-task model for all tasks (`haiku`, `sonnet`, `opus`, or full model ID) |
+| `--effort LEVEL` | Global effort override: `low`, `medium`, `high`, `xhigh`, `max`; overrides per-task `Effort:` field and config `effort` key |
 | `--parallel N` | Number of tasks to run concurrently (default: 1) |
 | `--dry-run` | Print resolved prompts without calling claude |
 | `--list` | List all tasks with resolved models, then exit |
+
+Any flag not recognized by autobuilderclaude is passed through to the claude CLI unchanged.
 
 ### Config precedence (lowest to highest)
 
@@ -101,6 +105,13 @@ Model: haiku
 Files: lib/db.py
 
 Prompt text here. Describe exactly what claude should create or modify.
+
+### Task 2 -- complex analysis
+Model: sonnet
+Effort: high
+
+Prompt text for a task that needs high effort. Omit Effort: to use the
+config effort key (or claude's default if neither is set).
 ```
 
 Tasks are executed in numeric order when sequential. With `--parallel`,
@@ -115,6 +126,7 @@ tasks complete.
 |-------|----------|-------------|
 | `Model:` | no | `haiku`, `sonnet`, `opus`, or full model ID. Falls back to `default_model`. |
 | `Files:` | no | Comma-separated list of target files (informational; shown in header). |
+| `Effort:` | no | Per-task effort level: `low`, `medium`, `high`, `xhigh`, `max`. Overrides config `effort`; overridden by CLI `--effort`. |
 
 ## Config file format
 
@@ -150,6 +162,7 @@ Copy it, fill in real paths, and pass it via `--template` or `--config`.
 | `license_file` | Path to a plain-text license header. Injected verbatim into every prompt. Set to `null` to skip. |
 | `preamble` | Text injected into every task prompt after `Working directory:` and before the task body. Use to set agent behavior (e.g. "complete all steps without asking for confirmation"). Omit or set to `""` to skip. |
 | `default_model` | Model alias used when a task has no `Model:` field. Default: `sonnet`. |
+| `effort` | Default effort level for claude (`low`/`medium`/`high`/`xhigh`/`max`). Overridden by a task's `Effort:` field or by CLI `--effort`. Omit for claude's default. |
 | `models` | Dict mapping `haiku`/`sonnet`/`opus` aliases to full model IDs. |
 
 ## Claude invocation
@@ -157,13 +170,18 @@ Copy it, fill in real paths, and pass it via `--template` or `--config`.
 Each task runs:
 
 ```
-claude --model MODEL -p --output-format json --allowedTools Edit Write --add-dir REPO [--add-dir DIR ...] < prompt
+claude --model MODEL -p --output-format json --allowedTools ... --add-dir REPO [--add-dir DIR ...] [EXTRA_ARGS] < prompt
 ```
 
-`--allowedTools Edit Write` permits claude to write files without
-interactive permission prompts. `--add-dir REPO` grants file access to
-the repo directory. Each entry in `add_dirs` adds another `--add-dir`
-flag. JSON output format is used to capture token usage.
+`--allowedTools` permits claude to write files without interactive
+permission prompts. `--add-dir REPO` grants file access to the repo
+directory. Each entry in `add_dirs` adds another `--add-dir` flag.
+JSON output format is used to capture token usage.
+
+`EXTRA_ARGS` are any flags not recognized by autobuilderclaude (passed
+through unchanged), plus `--effort LEVEL` resolved per task. Effort
+precedence: CLI `--effort` (global) > task `Effort:` field > config
+`effort` key.
 
 ## Parallel execution
 
@@ -289,12 +307,30 @@ Override model for a one-off test:
 autobuilderclaude --input docs/plan.md --task 3 --model sonnet
 ```
 
+Run with high effort globally (overrides any per-task `Effort:` field):
+
+```
+autobuilderclaude --input docs/plan.md --effort high
+```
+
+Per-task effort is set in the plan (`Effort: high` under a task heading);
+`--effort` on the command line overrides all per-task fields for the run.
+
+Run tasks 1 through 5 only (skip the rest and skip verification):
+
+```
+autobuilderclaude --input docs/plan.md --stop-after 5
+```
+
+Pass an extra claude flag through (e.g. `--verbose`):
+
+```
+autobuilderclaude --input docs/plan.md --verbose
+```
+
 Copyright (C) 2026 Kris Kirby
 
-SPDX-License-Identifier: GPL-3.0-or-later 
-# autobuilderclaude activity log
-# Append-only. One entry per session or significant change.
-# Format: YYYY-MM-DDThh:mm:ss+00:00 action -- detail
+SPDX-License-Identifier: GPL-3.0-or-later
 
 [2026-04-15] created -- auto-builder toolchain (precursor to autobuilderclaude)
   Origin project: openscraper
@@ -457,3 +493,30 @@ SPDX-License-Identifier: GPL-3.0-or-later
     - Subtitle: "autobuilder format v1" -> "autobuilderclaude format v1"
     - Historical activity log entries (2026-04-15) left unchanged -- accurately reflect legacy tool names
     - Added this activity log entry
+
+# line 147
+[2026-05-22T07:03:39+00:00 / 2026-05-22T02:03:39-0500] feature v1.4.1 -> v1.5.0 -- --effort, --stop-after, CLI pass-through
+  autobuilderclaude.py:
+    - Version bump to v1.5.0
+    - build_arg_parser: added --effort LEVEL (choices: low|medium|high|xhigh|max)
+    - build_arg_parser: added --stop-after N (stops after task N; suppresses verification)
+    - main: parse_known_args() instead of parse_args(); unrecognized flags collected as extra_args
+    - main: builds extra_claude_args = [--effort LEVEL if set] + extra_args (pass-through)
+    - main: effort resolved from --effort CLI flag first, then config effort key
+    - main: --task and --stop-after declared mutually exclusive
+    - main: stop-after filters selected list and sets run_verify=False
+    - run_claude: extra_claude_args parameter appended to claude_cmd
+    - _task_worker: extra_claude_args parameter threaded through; shown in task header if set
+    - All run_claude and _task_worker call sites updated to pass extra_claude_args
+    - Header usage comment updated: --effort, --stop-after, pass-through note
+  autobuilderclaude_config_v1.yaml:
+    - Added effort: null optional key with description
+  autobuilderclaude_plan_template_v1.md:
+    - Build Config YAML block: added # effort: high commented example
+    - PARSER RULES keys list: added effort
+  README.md:
+    - Options table: added --effort LEVEL and --stop-after N rows; added pass-through note
+    - Config keys table: added effort row
+    - Claude invocation: updated command line to show [EXTRA_ARGS]; documented pass-through
+    - Examples: added --effort, --stop-after, and pass-through examples
+    - Activity log section: appended this entry

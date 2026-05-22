@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.4.1
+# autobuilderclaude v1.5.5
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -37,11 +37,15 @@
 #   --config CONFIG       YAML config file (overrides plan Build Config and --template)
 #   --task N              Run only task N (integer) or "verify"
 #   --start-task N        Start at task N and run through the remaining tasks
+#   --stop-after N        Stop after task N completes (inclusive)
 #   --model MODEL         Override per-task model (haiku|sonnet|opus or full ID)
+#   --effort LEVEL        Global effort override (low|medium|high|xhigh|max);
+#                         overrides per-task Effort: field and config effort key
 #   --parallel N          Number of tasks to run concurrently (default: 1)
 #   --dry-run             Print prompts without calling claude
 #   --list                List tasks and models, then exit
 #   --help
+#   [any other flags]     Passed through to the claude CLI unchanged
 #
 # Plan format: see autobuilderclaude_plan_template_v1.md
 # Config format: see autobuilderclaude_config_v1.yaml
@@ -303,12 +307,26 @@ def resolve_model(alias, config):
     return aliases.get(alias) or DEFAULT_MODEL_IDS.get(alias) or alias
 
 
+def resolve_task_effort(task, cli_effort, config):
+    """
+    Return the effective effort string for a task (or verification dict).
+    Precedence: CLI --effort (global override) > task Effort: field > config effort key.
+    Returns empty string when no effort is set at any level.
+    """
+    if cli_effort:
+        return cli_effort
+    task_effort = (task.get('effort') or '').strip().lower()
+    if task_effort:
+        return task_effort
+    return str(config.get('effort') or '').strip().lower()
+
+
 # ---------------------------------------------------------------------------
 # Plan parser
 # ---------------------------------------------------------------------------
 
 _TASK_HEADING_RE = re.compile(r'^### Task (\d+) -- (.+)$', re.MULTILINE)
-_FIELD_RE        = re.compile(r'^(Model|Files):\s*(.+)$')
+_FIELD_RE        = re.compile(r'^(Model|Files|Effort):\s*(.+)$')
 _VERIFY_HEAD_RE  = re.compile(r'^## Verification[ \t]*$', re.MULTILINE)
 _SECTION_END_RE  = re.compile(r'^(?:---|## )', re.MULTILINE)
 
@@ -324,6 +342,7 @@ def _parse_fields_and_body(section_text):
     lines = section_text.lstrip('\n').split('\n')
     model = None
     files = []
+    effort = None
     field_end = 0
 
     for i, line in enumerate(lines):
@@ -334,6 +353,8 @@ def _parse_fields_and_body(section_text):
                 model = val.lower()
             elif key == 'Files':
                 files = [f.strip() for f in val.split(',') if f.strip()]
+            elif key == 'Effort':
+                effort = val.lower()
             field_end = i + 1
         elif line.strip() == '' and i < field_end + 2:
             # First blank line after (or immediately following) fields ends block.
@@ -350,7 +371,7 @@ def _parse_fields_and_body(section_text):
     while prompt_lines and prompt_lines[-1].strip() == '':
         prompt_lines.pop()
 
-    return model, files, '\n'.join(prompt_lines)
+    return model, files, effort, '\n'.join(prompt_lines)
 
 
 def _section_end(text, start):
@@ -382,13 +403,14 @@ def parse_tasks(plan_text):
             body_end = _section_end(plan_text, body_start)
 
         section = plan_text[body_start:body_end]
-        model, files, prompt_body = _parse_fields_and_body(section)
+        model, files, effort, prompt_body = _parse_fields_and_body(section)
 
         tasks.append({
             'num':         num,
             'title':       title,
             'model':       model,
             'files':       files,
+            'effort':      effort,
             'prompt_body': prompt_body,
         })
 
@@ -408,8 +430,8 @@ def parse_verification(plan_text):
     section_end   = _section_end(plan_text, section_start)
     section       = plan_text[section_start:section_end]
 
-    model, _, prompt_body = _parse_fields_and_body(section)
-    return {'model': model or 'sonnet', 'prompt_body': prompt_body}
+    model, _, effort, prompt_body = _parse_fields_and_body(section)
+    return {'model': model or 'sonnet', 'effort': effort, 'prompt_body': prompt_body}
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +511,7 @@ def write_completion_marker(log_dir, task_num, task_title, exit_code):
 # Claude invocation
 # ---------------------------------------------------------------------------
 
-def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_tools=None, _lines=None):
+def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_tools=None, extra_claude_args=None, _lines=None):
     """
     Pipe prompt to claude on stdin. Capture stdout+stderr to log files
     and echo to the terminal. Return (exit_code, usage_dict).
@@ -529,6 +551,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
                   '--allowedTools'] + tools
     for d in (add_dirs or []):
         claude_cmd += ['--add-dir', d]
+    claude_cmd += (extra_claude_args or [])
 
     cmd = claude_cmd
 
@@ -602,7 +625,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
     return proc.returncode, usage
 
 
-def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed_tools=None):
+def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed_tools=None, extra_claude_args=None):
     """
     Worker for parallel execution. Buffers all output, returns
     (task_num, rc, usage, lines) where lines is a list of strings to print.
@@ -613,11 +636,13 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
         f'  Task {task["num"]} -- {task["title"]}',
         f'  model: {model}',
     ]
+    if extra_claude_args:
+        lines.append(f'  claude args: {" ".join(extra_claude_args)}')
     if task['files']:
         lines.append(f'  files: {", ".join(task["files"])}')
     lines.append('=' * 70)
 
-    rc, usage = run_claude(prompt, model, dry_run, log_dir, label, add_dirs, allowed_tools, _lines=lines)
+    rc, usage = run_claude(prompt, model, dry_run, log_dir, label, add_dirs, allowed_tools, extra_claude_args, _lines=lines)
     marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
     lines.append(f'  marker  -> {marker}')
     return task['num'], rc, usage, lines
@@ -630,12 +655,13 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.4.1 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.5.5 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
             'Config format: autobuilderclaude_config_v1.yaml\n'
-            'https://github.com/ke4ahr/autobuilderclaude'
+            'https://github.com/ke4ahr/autobuilderclaude\n\n'
+            'Any unrecognized flags are passed through to the claude CLI unchanged.'
         ),
     )
     p.add_argument('--input',    metavar='PLAN',     required=True,
@@ -648,8 +674,13 @@ def build_arg_parser():
                    help='Run only task N (integer) or "verify"')
     p.add_argument('--start-task', metavar='N', type=int,
                    help='Start at task N and run through all remaining tasks')
+    p.add_argument('--stop-after', metavar='N', type=int,
+                   help='Stop after task N completes (inclusive); verification is skipped')
     p.add_argument('--model',    metavar='MODEL',
                    help='Override per-task model (haiku|sonnet|opus, a full Claude model ID, or a provider/model:tag ID such as nvidia/nemotron-3-super-120b-a12b:free)')
+    p.add_argument('--effort',   metavar='LEVEL',
+                   choices=['low', 'medium', 'high', 'xhigh', 'max'],
+                   help='Global effort level (low|medium|high|xhigh|max); overrides per-task Effort: field and config effort key')
     p.add_argument('--parallel', metavar='N', type=int, default=1,
                    help='Number of tasks to run concurrently (default: 1)')
     p.add_argument('--dry-run',  action='store_true',
@@ -665,7 +696,7 @@ def build_arg_parser():
 
 def main():
     parser = build_arg_parser()
-    args = parser.parse_args()
+    args, extra_args = parser.parse_known_args()
 
     if args.parallel < 1:
         print('ERROR: --parallel must be >= 1', file=sys.stderr)
@@ -703,24 +734,38 @@ def main():
         print('ERROR: no tasks or verification section found in plan.', file=sys.stderr)
         sys.exit(1)
 
+    # Pass-through args go to every claude invocation unchanged.
+    # Effort is resolved per-task via resolve_task_effort(); --effort is the global override.
+    pass_through_args = extra_args
+
     # --list
     if args.list:
         print(f'Plan:  {plan_path}')
+        if args.effort:
+            print(f'Effort (global override): {args.effort}')
+        if pass_through_args:
+            print(f'Claude pass-through args: {" ".join(pass_through_args)}')
         default_model = config.get('default_model', 'sonnet')
         for t in tasks:
-            model = resolve_model(t['model'] or default_model, config)
-            files = ', '.join(t['files']) if t['files'] else '(none)'
+            model  = resolve_model(t['model'] or default_model, config)
+            files  = ', '.join(t['files']) if t['files'] else '(none)'
+            effort = resolve_task_effort(t, args.effort, config)
             print(f'  Task {t["num"]:>3} -- {t["title"]}')
             print(f'           model: {model}')
+            print(f'          effort: {effort or "(default)"}')
             print(f'           files: {files}')
         if verification:
-            model = resolve_model(verification['model'], config)
-            print(f'  Verify       -- model: {model}')
+            model  = resolve_model(verification['model'], config)
+            effort = resolve_task_effort(verification, args.effort, config)
+            print(f'  Verify       -- model: {model}  effort: {effort or "(default)"}')
         sys.exit(0)
 
     # Determine which tasks to run.
     if args.task and args.start_task is not None:
         print('ERROR: --task and --start-task are mutually exclusive', file=sys.stderr)
+        sys.exit(1)
+    if args.task and args.stop_after is not None:
+        print('ERROR: --task and --stop-after are mutually exclusive', file=sys.stderr)
         sys.exit(1)
 
     run_verify = False
@@ -757,12 +802,30 @@ def main():
         selected   = tasks
         run_verify = verification is not None
 
+    # --stop-after: trim the selected list and suppress verification.
+    if args.stop_after is not None:
+        selected   = [t for t in selected if t['num'] <= args.stop_after]
+        run_verify = False
+        if not selected:
+            nums = [str(t['num']) for t in tasks]
+            print(
+                f'ERROR: no tasks <= {args.stop_after}. Available: {", ".join(nums)}',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     run_ts   = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
     log_dir  = make_run_log_dir(config, plan_path, run_ts)
     _extra_dirs = config.get('add_dirs') or []
     add_dirs = [d for d in ([config.get('repo', '').strip()] + list(_extra_dirs)) if d]
     allowed_tools_list = config.get('allowed_tools') or ['Edit', 'Write']
     print(f'Log dir: {log_dir}')
+    if args.effort:
+        print(f'Effort (global override): {args.effort}')
+    if pass_through_args:
+        print(f'Claude pass-through args: {" ".join(pass_through_args)}')
+    if args.stop_after is not None:
+        print(f'Stop after: task {args.stop_after}')
     if args.parallel > 1:
         print(f'Parallel: {args.parallel} workers')
 
@@ -784,7 +847,7 @@ def main():
             exit_code = rc
 
     if args.parallel > 1 and len(selected) > 1:
-        # Build all (task, model, prompt, label) tuples up front.
+        # Build all (task, model, prompt, label, task_claude_args) tuples up front.
         work_items = []
         for task in selected:
             model_key = args.model or task['model'] or default_model
@@ -792,14 +855,16 @@ def main():
             safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
             label      = f'task_{task["num"]:03d}_{safe_title}'
             prompt     = build_prompt(task, config)
-            work_items.append((task, model, prompt, label))
+            effort     = resolve_task_effort(task, args.effort, config)
+            task_claude_args = (['--effort', effort] if effort else []) + pass_through_args
+            work_items.append((task, model, prompt, label, task_claude_args))
 
         with ThreadPoolExecutor(max_workers=args.parallel) as executor:
             futures = {
                 executor.submit(
-                    _task_worker, task, model, prompt, args.dry_run, log_dir, label, add_dirs, allowed_tools_list
+                    _task_worker, task, model, prompt, args.dry_run, log_dir, label, add_dirs, allowed_tools_list, task_claude_args
                 ): task['num']
-                for task, model, prompt, label in work_items
+                for task, model, prompt, label, task_claude_args in work_items
             }
             for future in as_completed(futures):
                 try:
@@ -819,18 +884,22 @@ def main():
             model     = resolve_model(model_key, config)
             safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
             label      = f'task_{task["num"]:03d}_{safe_title}'
+            effort     = resolve_task_effort(task, args.effort, config)
+            task_claude_args = (['--effort', effort] if effort else []) + pass_through_args
 
             print()
             print('=' * 70)
             print(f'  Task {task["num"]} -- {task["title"]}')
             print(f'  model: {model}')
+            if task_claude_args:
+                print(f'  claude args: {" ".join(task_claude_args)}')
             if task['files']:
                 print(f'  files: {", ".join(task["files"])}')
             print('=' * 70)
 
             prompt = build_prompt(task, config)
             try:
-                rc, usage = run_claude(prompt, model, args.dry_run, log_dir, label, add_dirs, allowed_tools_list)
+                rc, usage = run_claude(prompt, model, args.dry_run, log_dir, label, add_dirs, allowed_tools_list, task_claude_args)
             except RateLimitError as e:
                 print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
                 print('Remaining tasks skipped.', file=sys.stderr)
@@ -840,18 +909,22 @@ def main():
             _accumulate(rc, usage, task['num'])
 
     if run_verify and verification:
-        model_key = args.model or verification['model']
-        model     = resolve_model(model_key, config)
+        model_key    = args.model or verification['model']
+        model        = resolve_model(model_key, config)
+        effort       = resolve_task_effort(verification, args.effort, config)
+        verify_claude_args = (['--effort', effort] if effort else []) + pass_through_args
 
         print()
         print('=' * 70)
         print(f'  Verification')
         print(f'  model: {model}')
+        if verify_claude_args:
+            print(f'  claude args: {" ".join(verify_claude_args)}')
         print('=' * 70)
 
         prompt = build_prompt(verification, config)
         try:
-            rc, usage = run_claude(prompt, model, args.dry_run, log_dir, 'verify', add_dirs, allowed_tools_list)
+            rc, usage = run_claude(prompt, model, args.dry_run, log_dir, 'verify', add_dirs, allowed_tools_list, verify_claude_args)
         except RateLimitError as e:
             print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
             sys.exit(1)

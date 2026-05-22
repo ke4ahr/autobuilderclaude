@@ -45,7 +45,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
   BUILD CONFIG (optional if --config file is provided)
     A "## Build Config" section contains a fenced YAML block.
-    Keys: repo, log_dir, license_file, default_model, models (dict of aliases).
+    Keys: repo, log_dir, license_file, default_model, effort, models (dict of aliases).
     The --config file overrides any key present in this block.
     See autobuilder_config_v1.yaml for all supported keys.
 
@@ -61,12 +61,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
     Required:
       Model: haiku | sonnet | opus | <full-model-id>
     Optional:
-      Files: path/relative/to/repo [, path2, path3]
+      Files:  path/relative/to/repo [, path2, path3]
+      Effort: low | medium | high | xhigh | max
     "haiku", "sonnet", "opus" resolve via models aliases in Build Config or
     config file. A full model ID (e.g. nvidia/nemotron-3-super-120b-a12b:free)
     is passed directly to the claude CLI. OpenRouter models require
     ANTHROPIC_BASE_URL=https://openrouter.ai/api and ANTHROPIC_AUTH_TOKEN set
     in the environment. A command-line --model flag overrides the per-task field.
+    Effort: overrides the config effort key for that task; a command-line --effort
+    flag is a global override that takes precedence over all per-task Effort: fields.
 
   PROMPT BODY
     Everything after the blank line that follows the per-task fields,
@@ -104,6 +107,7 @@ repo:          /absolute/path/to/project/root
 log_dir:       /absolute/path/to/tmp_build_logs
 license_file:  /absolute/path/to/LICENSE_HEADER.txt
 default_model: sonnet
+# effort:      high   # Effort level for claude (low|medium|high|xhigh|max). Omit for default.
 # models_file: load additional model IDs from a plain-text file (one per line).
 # Each ID becomes a self-mapping alias usable in task Model: fields.
 # Requires ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN for OpenRouter models.
