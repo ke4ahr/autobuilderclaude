@@ -11,7 +11,9 @@ are captured to timestamped log files. Token usage is reported per task
 and as a run total. Each task is timed; elapsed time is printed in both
 seconds and minutes forms (e.g. `426.7s, 7m6.700s`). On a 429/rate-limit
 response that contains a reset time, the script sleeps until (reset_time
-+ 10 minutes) and retries the failing task automatically.
++ 10 minutes) and retries the failing task automatically. Sleeps longer
+than 24 hours are supported; a progress line is printed every 2 hours
+during the wait.
 
 ## Requirements
 
@@ -218,10 +220,14 @@ read from prompt cache, `cache_write` = tokens written to prompt cache.
 ## Rate-limit handling
 
 When claude exits non-zero and its output contains a usage-rate-limit message,
-the script attempts to extract a reset time from the message. Three formats are
-recognized: ISO 8601 (e.g. `2026-05-22T14:00:00Z`), 12-hour clock with TZ
-abbreviation (e.g. `9:00 PM CDT on Thursday, May 22, 2026`), and relative
-offsets (e.g. `retry after 60 seconds`).
+the script attempts to extract a reset time from the message. Five formats are
+recognized:
+
+- ISO 8601 (e.g. `2026-05-22T14:00:00Z`)
+- 12-hour clock with TZ abbreviation (e.g. `9:00 PM CDT on Thursday, May 22, 2026`)
+- Relative offsets (e.g. `retry after 60 seconds`)
+- Date + time + IANA zone (e.g. `May 26, 12pm (America/Chicago)`)
+- Time-only + IANA zone (e.g. `7:20am (America/Chicago)`)
 
 If a reset time is found, the script sleeps until (reset_time + 10 minutes)
 and then retries the failing task automatically:
@@ -229,6 +235,12 @@ and then retries the failing task automatically:
 ```
   Rate limit -- resets 2026-05-22T14:00:00+00:00; sleeping 3612s (wake 2026-05-22T15:00:12+00:00)
   Retrying ...
+```
+
+For sleeps longer than 2 hours, a progress line is printed every 2 hours:
+
+```
+  Rate limit sleep -- 86392s remaining (wake 2026-05-23T15:00:12+00:00)
 ```
 
 If the retry succeeds, processing continues with the next task normally.

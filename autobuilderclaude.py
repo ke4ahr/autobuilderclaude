@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.5.5
+# autobuilderclaude v1.5.6
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -26,7 +26,8 @@
 # Output token count is printed as a dedicated line per task.
 # On a 429/rate-limit response that contains a
 # reset time, the script sleeps until (reset_time + 10 minutes) and retries
-# the failing task automatically before resuming normal processing.
+# the failing task automatically. Sleeps longer than 24 hours are supported;
+# a progress line is printed every 2 hours during the wait.
 #
 # Usage:
 #   autobuilderclaude --input PLAN [--template TEMPLATE] [--config CONFIG] [OPTIONS]
@@ -107,11 +108,19 @@ _RESET_RELATIVE_RE = re.compile(
     r'(?:reset|retry|wait)\s+(?:in|after)\s+(\d+)\s*(second|minute|hour)s?',
     re.IGNORECASE,
 )
-# "7:20am (America/Chicago)" -- time-only with IANA zone in parens
+# "7:20am (America/Chicago)" or "12pm (America/Chicago)" -- time-only with IANA zone
 _RESET_TIME_IANA_RE = re.compile(
-    r'(\d{1,2}:\d{2})\s*([ap]m)\s*\(([A-Za-z_/]+)\)',
+    r'(\d{1,2}(?::\d{2})?)\s*([ap]m)\s*\(([A-Za-z_/]+)\)',
     re.IGNORECASE,
 )
+# "May 26, 12pm (America/Chicago)" -- month + day + time with IANA zone
+_RESET_DATE_IANA_RE = re.compile(
+    r'(\w+)\s+(\d{1,2}),?\s*(\d{1,2}(?::\d{2})?)\s*([ap]m)\s*\(([A-Za-z_/]+)\)',
+    re.IGNORECASE,
+)
+
+# Progress interval for long rate-limit sleeps (seconds).
+_SLEEP_REPORT_INTERVAL = 7200
 
 _TZ_OFFSETS = {
     'UTC': 0, 'GMT': 0,
@@ -200,7 +209,36 @@ def parse_reset_time(message):
             delta = timedelta(hours=amount)
         return datetime.now(timezone.utc) + delta
 
-    # "7:20am (America/Chicago)" -- time-only with IANA zone name
+    # "May 26, 12pm (America/Chicago)" -- month+day + time + IANA zone name
+    if _HAVE_ZONEINFO:
+        m = _RESET_DATE_IANA_RE.search(message)
+        if m:
+            month_str = m.group(1)
+            day_str   = m.group(2)
+            time_str  = m.group(3)
+            ampm      = m.group(4).upper()
+            iana_zone = m.group(5)
+            month = _MONTH_NAMES.get(month_str.lower())
+            if month:
+                try:
+                    tz = ZoneInfo(iana_zone)
+                    parts = time_str.split(':')
+                    h  = int(parts[0])
+                    mn = int(parts[1]) if len(parts) > 1 else 0
+                    if ampm == 'PM' and h != 12:
+                        h += 12
+                    elif ampm == 'AM' and h == 12:
+                        h = 0
+                    now_utc  = datetime.now(timezone.utc)
+                    year     = now_utc.astimezone(tz).year
+                    reset_dt = datetime(year, month, int(day_str), h, mn, 0, tzinfo=tz)
+                    if reset_dt.astimezone(timezone.utc) <= now_utc:
+                        reset_dt = datetime(year + 1, month, int(day_str), h, mn, 0, tzinfo=tz)
+                    return reset_dt.astimezone(timezone.utc)
+                except (_ZINotFoundError, ValueError):
+                    pass
+
+    # "7:20am (America/Chicago)" or "12pm (America/Chicago)" -- time-only with IANA zone
     if _HAVE_ZONEINFO:
         m = _RESET_TIME_IANA_RE.search(message)
         if m:
@@ -211,7 +249,7 @@ def parse_reset_time(message):
                 tz = ZoneInfo(iana_zone)
                 parts = time_str.split(':')
                 h  = int(parts[0])
-                mn = int(parts[1])
+                mn = int(parts[1]) if len(parts) > 1 else 0
                 if ampm == 'PM' and h != 12:
                     h += 12
                 elif ampm == 'AM' and h == 12:
@@ -615,7 +653,17 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
                     f'sleeping {sleep_secs:.0f}s '
                     f'(wake {wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")})'
                 )
-                time.sleep(sleep_secs)
+                remaining = sleep_secs
+                while remaining > 0:
+                    chunk = min(remaining, _SLEEP_REPORT_INTERVAL)
+                    time.sleep(chunk)
+                    remaining -= chunk
+                    if remaining > 0:
+                        still_left = max(0.0, (wake_dt - datetime.now(timezone.utc)).total_seconds())
+                        _out(
+                            f'  Rate limit sleep -- {still_left:.0f}s remaining '
+                            f'(wake {wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")})'
+                        )
                 _out('  Retrying ...')
                 continue
             raise RateLimitError(text_output.strip()[:300])
@@ -655,7 +703,7 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.5.5 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.5.6 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
