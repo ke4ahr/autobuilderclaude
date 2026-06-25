@@ -45,7 +45,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
   BUILD CONFIG (optional if --config file is provided)
     A "## Build Config" section contains a fenced YAML block.
-    Keys: repo, log_dir, license_file, default_model, effort, models (dict of aliases).
+    Keys: repo, log_dir, license_file, default_model, effort, allowed_tools, models (dict of aliases).
     The --config file overrides any key present in this block.
     See autobuilder_config_v1.yaml for all supported keys.
 
@@ -58,11 +58,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
   PER-TASK FIELDS
     Appear immediately after the ### Task heading, one per line, no blank lines
     between them.
-    Required:
-      Model: haiku | sonnet | opus | <full-model-id>
     Optional:
+      Model: haiku | sonnet | opus | <full-model-id>
+              (falls back to default_model from Build Config / --config if omitted)
       Files:  path/relative/to/repo [, path2, path3]
       Effort: low | medium | high | xhigh | max
+      ExecWindow: HH:MM-HH:MM [TZ] [; HH:MM-HH:MM [TZ] ...]
     "haiku", "sonnet", "opus" resolve via models aliases in Build Config or
     config file. A full model ID (e.g. nvidia/nemotron-3-super-120b-a12b:free)
     is passed directly to the claude CLI. OpenRouter models require
@@ -70,6 +71,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
     in the environment. A command-line --model flag overrides the per-task field.
     Effort: overrides the config effort key for that task; a command-line --effort
     flag is a global override that takes precedence over all per-task Effort: fields.
+    ExecWindow: restricts when this task may run. TZ is an IANA zone
+    (America/Chicago) or abbreviation (CDT/CST/UTC); omitted TZ defaults to UTC.
+    start>end wraps past midnight (22:00-06:00). Multiple windows separated by
+    ";". The task blocks (sleeping in wait increments) until inside a window.
+    Overrides the config exec_window key for that task. No command-line override
+    exists for this field.
 
   PROMPT BODY
     Everything after the blank line that follows the per-task fields,
@@ -88,6 +95,29 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
       Model: sonnet   (or haiku or opus)
     The prompt body instructs claude to run shell/sqlite commands and
     report PASS or FAIL per step with actual output quoted.
+
+  CHAT LOG CONVENTIONS
+    ALL discovered behavior must be written in prose form to the project chat log,
+    immediately upon discovery. Do NOT defer to end-of-session.
+    Each entry: wc-l line count marker, timestamp (UTC / local with session tag), prose description.
+    Format: one finding per entry. Chat log is the primary narrative record.
+    Activity log holds summaries, counts, and session-level milestones.
+
+  ACTIVITY LOG CONVENTIONS
+    Every activity log entry heading must include the session number in (sN) form.
+    Session numbering starts at s1 for new projects and increments by 1 each session.
+    Entry heading format:
+      ## YYYY-MM-DDThh:mm:ss+00:00 / YYYY-MM-DDThh:mm:ss-0500 (sN) -- short description
+    Lessons Learned, Findings, and User Contributions belong in the activity log:
+      Findings: tag as "FINDING:" -- significant factual discoveries (addresses, hardware
+        identification, protocol behavior, data layout, etc.).
+      Lessons Learned: tag as "LL-NNN:" -- VERIFIED reusable process insights only.
+        Copy each LL entry to lessons_learned_0000.md after writing it here.
+      User Contributions: tag as "UC:" -- items submitted by the user that have not yet
+        been verified. These stay under "User Contributions" in the activity log until
+        verified. After verification, promote to LL-NNN and copy to lessons_learned_0000.md.
+    Before appending: run wc -l and write the count as a bare "# line N" comment above
+    the new entry. This is required format for all activity log appends.
 
   SECTIONS IGNORED BY PARSER
     ## Overview, ## Dependencies, ## Notes, and any other ## headings outside
@@ -108,6 +138,8 @@ log_dir:       /absolute/path/to/tmp_build_logs
 license_file:  /absolute/path/to/LICENSE_HEADER.txt
 default_model: sonnet
 # effort:      high   # Effort level for claude (low|medium|high|xhigh|max). Omit for default.
+# exec_window: "22:00-06:00 America/Chicago"   # Default time window for all tasks; a
+# task's ExecWindow: field overrides this. Omit for unrestricted (run anytime).
 # models_file: load additional model IDs from a plain-text file (one per line).
 # Each ID becomes a self-mapping alias usable in task Model: fields.
 # Requires ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN for OpenRouter models.
@@ -139,6 +171,7 @@ if the context is useful to claude.}
 ### Task 1 -- {short-title}
 Model: haiku
 Files: {lib/example.py}
+# ExecWindow: 22:00-06:00 America/Chicago
 
 {Prompt body. Describe exactly what to implement.
 Include: class/function names, method signatures, argument types, return types,

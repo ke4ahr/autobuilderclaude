@@ -163,9 +163,15 @@ Copy it, fill in real paths, and pass it via `--template` or `--config`.
 | `log_dir` | Directory for log files. Created if absent. Default: `../tmp_build_logs` relative to the plan file. |
 | `license_file` | Path to a plain-text license header. Injected verbatim into every prompt. Set to `null` to skip. |
 | `preamble` | Text injected into every task prompt after `Working directory:` and before the task body. Use to set agent behavior (e.g. "complete all steps without asking for confirmation"). Omit or set to `""` to skip. |
+| `allowed_tools` | List of tools passed via `--allowedTools`. Set to `null` or omit to use the built-in default: `['Bash', 'Edit', 'Read', 'Write']`. Include `mcp__GhidraMCP__*` (or other `mcp__*` entries) explicitly if a task needs MCP tool access -- it is not granted by the default. |
 | `default_model` | Model alias used when a task has no `Model:` field. Default: `sonnet`. |
 | `effort` | Default effort level for claude (`low`/`medium`/`high`/`xhigh`/`max`). Overridden by a task's `Effort:` field or by CLI `--effort`. Omit for claude's default. |
 | `models` | Dict mapping `haiku`/`sonnet`/`opus` aliases to full model IDs. |
+
+`models`, `add_dirs`, and `allowed_tools` are type-checked at startup: `null`/omitted
+is always valid, but a value of the wrong type (e.g. `add_dirs: /some/path` instead of
+a list) exits 1 with a clear error naming the bad key and the type found, instead of
+crashing later with a raw traceback.
 
 ## Claude invocation
 
@@ -198,6 +204,15 @@ regardless of `--parallel`.
 Use `--parallel` for independent tasks (e.g. separate library files).
 Avoid it for tasks with ordering dependencies.
 
+If two or more concurrently-selected tasks declare the same `Files:` entry,
+a non-fatal warning is printed before the run starts, listing the file and
+the colliding task numbers. The run still proceeds -- review the warning and
+re-run sequentially (or split `--task`) if the collision is unintentional.
+
+If any worker raises an exception -- a rate limit or otherwise -- the thread
+pool aborts promptly without waiting for other in-flight workers (including
+any sleeping through an exec-window or rate-limit wait) to finish first.
+
 ## Token usage
 
 Token counts are printed after each task on the output line, followed by a
@@ -219,18 +234,26 @@ read from prompt cache, `cache_write` = tokens written to prompt cache.
 
 ## Rate-limit handling
 
-When claude exits non-zero and its output contains a usage-rate-limit message,
-the script attempts to extract a reset time from the message. Five formats are
-recognized:
+When claude's output contains a usage-rate-limit message, the script attempts to
+extract a reset time from the message. This is treated as a real rate limit if
+claude exited non-zero, OR -- on exit 0 -- the message matches one of the
+low-false-positive reset-time patterns below (ISO 8601, an IANA-zone date or time,
+or a relative offset phrase). A bare 12-hour clock with no date and no IANA zone
+(e.g. a lone "9:00 PM") is too generic to trust as a standalone signal on a
+successful exit, so it only triggers retry handling when claude also exited
+non-zero. Five reset-time formats are recognized:
 
 - ISO 8601 (e.g. `2026-05-22T14:00:00Z`)
-- 12-hour clock with TZ abbreviation (e.g. `9:00 PM CDT on Thursday, May 22, 2026`)
+- 12-hour clock with TZ abbreviation, with or without a date (e.g.
+  `9:00 PM CDT on Thursday, May 22, 2026` or just `9:00 PM CDT`). When no date is
+  given, today is assumed (or tomorrow, if that time has already passed).
 - Relative offsets (e.g. `retry after 60 seconds`)
 - Date + time + IANA zone (e.g. `May 26, 12pm (America/Chicago)`)
-- Time-only + IANA zone (e.g. `7:20am (America/Chicago)`)
+- Time-only + IANA zone (e.g. `7:20am (America/Chicago)`). When no date is given,
+  today is assumed (or tomorrow, if that time has already passed).
 
 If a reset time is found, the script sleeps until (reset_time + 10 minutes)
-and then retries the failing task automatically:
+and then retries the failing task automatically, up to 3 times:
 
 ```
   Rate limit -- resets 2026-05-22T14:00:00+00:00; sleeping 3612s (wake 2026-05-22T15:00:12+00:00)
@@ -245,8 +268,8 @@ For sleeps longer than 2 hours, a progress line is printed every 2 hours:
 
 If the retry succeeds, processing continues with the next task normally.
 
-If no reset time is found in the message, or if the retry also hits a rate
-limit, the run aborts immediately:
+If no reset time is found in the message, or if all 3 retries also hit a
+rate limit, the run aborts immediately:
 
 ```
 ERROR: rate limit reached -- <message excerpt>
@@ -261,6 +284,7 @@ Each run creates a timestamped subdirectory under `log_dir`:
 {log_dir}/{plan_stem}_{YYYY-MM-DDThh:mm:ss+00:00}/
   task_001_{title}_{hh:mm:ss+00:00}_prompt.txt
   task_001_{title}_{hh:mm:ss+00:00}_output.txt
+  task_001_{title}_{hh:mm:ss+00:00}_stderr.txt  (only if claude wrote to stderr)
   task_1_YYYY-MM-DD_completed.txt   (exit 0)
   task_1_YYYY-MM-DD_failed.txt      (exit non-zero)
   task_002_...
@@ -269,6 +293,7 @@ Each run creates a timestamped subdirectory under `log_dir`:
 ```
 
 Output files contain the text response only (JSON envelope stripped).
+Stderr files capture any output written to stderr by the claude subprocess.
 
 Each completed task drops a marker file named
 `task_N_YYYY-MM-DD_completed.txt` (exit 0) or `task_N_YYYY-MM-DD_failed.txt`
@@ -531,4 +556,81 @@ SPDX-License-Identifier: GPL-3.0-or-later
     - Config keys table: added effort row
     - Claude invocation: updated command line to show [EXTRA_ARGS]; documented pass-through
     - Examples: added --effort, --stop-after, and pass-through examples
+    - Activity log section: appended this entry
+
+# line 536
+[2026-05-30T02:19:44+00:00 / 2026-05-29T21:19:44-0500] patch v1.5.6 -> v1.5.7 -- stderr logging
+  autobuilderclaude.py:
+    - run_claude: if err is non-empty, writes it to task_NNN_..._stderr.txt alongside output log
+    - Version bump to v1.5.7 (header comment and argparse description)
+  README.md:
+    - Log files section: added _stderr.txt entry with conditional note
+    - Activity log section: appended this entry
+
+# line 551
+[2026-06-25T21:51:53+00:00 / 2026-06-25T16:51:53-0500] patch v1.6.0 -> v1.6.1 -- 10-item expert review fix pass
+  autobuilderclaude.py:
+    - Fix 1: is_limit gating changed to keyword AND (exit!=0 OR IANA-zone match), closing
+      a false-positive hole while preserving the documented exit-0 catch
+    - Fix 2: added DEFAULT_ALLOWED_TOOLS = ['Bash','Edit','Read','Write'] constant; both
+      call sites use it. BEHAVIOR CHANGE: the bare default no longer includes
+      'mcp__GhidraMCP__*' -- a caller relying on default --allowedTools now needs an
+      explicit allowed_tools config key to retain MCP tool access
+    - Fix 3: None-safety guard (str(value or '').strip()) applied to repo/preamble/
+      log_dir and to main()'s add_dirs comprehension (4 sites total)
+    - Fix 4: rewrote _parse_fields_and_body()'s field/body boundary detection to
+      deterministic per-line classification, replacing a distance heuristic that could
+      silently drop a stray prompt-body line
+    - Fix 5: added validate_tasks(tasks) -- hard error (exit 1) on duplicate Task N
+      numbers; warning-only on a non-gap-free/non-1-start numbering sequence
+    - Fix 6: added a repo-directory-existence check in main() -- exits 1 with an error
+      if config repo is set but is not a directory
+    - Fix 7: added _MAX_RATE_LIMIT_RETRIES = 3; retry gate changed from a single retry
+      (attempt == 1) to attempt <= _MAX_RATE_LIMIT_RETRIES
+    - Fix 10: added warn_parallel_file_collisions(selected), called in main() at the
+      start of the --parallel branch -- non-fatal warning listing any Files: entries
+      declared by more than one concurrently-selected task
+    - Version bump to v1.6.1 (header comment and argparse description)
+  autobuilderclaude_config_v1.yaml:
+    - Fix 8: added a comment above log_dir documenting the ../tmp_build_logs fallback
+      (doc-only; the fallback behavior itself was unchanged, already correct)
+  autobuilderclaude_plan_template_v1.md:
+    - Fix 9: moved per-task Model: from a "Required:" heading to "Optional:", with a
+      note that it falls back to default_model -- the template had contradicted both
+      README.md and the actual code
+  README.md:
+    - Config keys table: added allowed_tools row documenting the default and the
+      mcp__GhidraMCP__* opt-in behavior change from Fix 2
+    - Parallel execution section: documented the Fix 10 file-collision warning
+    - Activity log section: appended this entry
+
+# line 605
+[2026-06-25T23:34:33+00:00 / 2026-06-25T18:34:33-0500] patch v1.6.1 -> v1.6.2 -- 2nd expert review fix pass
+  autobuilderclaude.py:
+    - Fix 1: is_limit gating now also accepts ISO 8601, relative-offset, and date+IANA-
+      zone reset patterns (not just bare time+IANA-zone) as the secondary signal that
+      qualifies an exit-0 response as a real rate limit
+    - Fix 2: parse_reset_time()'s 12-hour-clock+TZ-abbreviation branch now has a date-
+      less fallback ("9:00 PM CDT" with no date assumes today, or tomorrow if already
+      passed) -- previously returned None, which raised immediately on the first hit
+      instead of retrying
+    - Fix 3: added validate_config_types(config) -- hard error (exit 1) when models,
+      add_dirs, or allowed_tools holds the wrong YAML type, naming the bad key and the
+      type found. Also fixed the two remaining unguarded `config.get('models', {})`
+      reads to `config.get('models') or {}`, since `models: null` is valid input
+    - Fix 4: parallel-mode `with ThreadPoolExecutor(...) as executor:` replaced with an
+      explicit try/finally so `shutdown(wait=False, cancel_futures=True)` runs on every
+      exit path (success, rate limit, or any other worker exception), not just rate
+      limits -- previously any other exception triggered the default
+      shutdown(wait=True), blocking on all other in-flight workers first
+    - Fix 5: build_prompt()'s license_file read now uses the same
+      `str(x or '').strip()` guard as its repo/preamble siblings (style-only; behavior
+      unchanged)
+    - Version bump to v1.6.2 (header comment and argparse description)
+  README.md:
+    - Config keys table: added a note on validate_config_types() (Fix 3)
+    - Rate-limit handling section: corrected the exit-0 gating description and
+      documented the date-less TZ-abbreviation fallback (Fixes 1, 2)
+    - Parallel execution section: documented the Fix 4 prompt-abort behavior for
+      non-rate-limit exceptions
     - Activity log section: appended this entry

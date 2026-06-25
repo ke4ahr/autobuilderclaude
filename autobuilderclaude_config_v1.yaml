@@ -41,6 +41,7 @@ repo: <absolute path to repo root>
 # Directory for build logs. Created automatically if it does not exist.
 # Recommended: one level above the repo (sibling directory).
 # Example: if repo is /home/user/project, use /home/user/tmp_build_logs
+# If omitted, default: ../tmp_build_logs relative to the plan file.
 log_dir: <absolute path to log directory>
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,16 @@ preamble: |
   Do not stop mid-task to ask "Continue?" or "Shall I proceed?".
   Apply all renames, writes, and changes as directed. Report results when done.
 
+# Tools claude is allowed to use, passed via --allowedTools. Set to null or
+# omit to use the built-in default: ['Bash', 'Edit', 'Read', 'Write'].
+allowed_tools: null
+# allowed_tools:
+#   - Bash
+#   - Edit
+#   - Read
+#   - Write
+#   - mcp__GhidraMCP__*
+
 # Default model when a task's Model: field is absent or unrecognized.
 # Must be one of the keys in the models dict below, or a full model ID.
 default_model: sonnet
@@ -75,6 +86,17 @@ default_model: sonnet
 # Effort level passed to claude via --effort (low|medium|high|xhigh|max).
 # Set to null or omit to use claude's default. Command-line --effort overrides this.
 effort: null
+
+# Default allowed execution time window, applied to every task that has no
+# per-task ExecWindow: field. Format: "HH:MM-HH:MM [TZ]", semicolon-separated
+# for multiple windows. TZ is an IANA zone (America/Chicago) or abbreviation
+# (CDT/CST/UTC); omitted TZ defaults to UTC. start>end wraps past midnight.
+# A task blocks (sleeping in wait increments) until inside a window.
+# Set to null or omit for unrestricted (tasks run anytime). No command-line
+# override exists for this setting.
+exec_window: null
+# exec_window: "22:00-06:00 America/Chicago"
+# exec_window: "00:00-06:00 UTC; 12:00-13:00 UTC"
 
 # ---------------------------------------------------------------------------
 # Additional models file (optional)
