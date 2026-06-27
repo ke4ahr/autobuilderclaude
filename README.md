@@ -235,8 +235,12 @@ read from prompt cache, `cache_write` = tokens written to prompt cache.
 ## Rate-limit handling
 
 When claude's output contains a usage-rate-limit message, the script attempts to
-extract a reset time from the message. This is treated as a real rate limit if
-claude exited non-zero, OR -- on exit 0 -- the message matches one of the
+extract a reset time from the message. The message must first match one of the
+recognized limit-keyword phrases: `hit your limit`, `hit your <word> limit` (e.g.
+"hit your session limit", "hit your weekly limit" -- any single word between
+"your" and "limit"), `usage limit`, `rate limit`/`rate-limit`, `exceeded ... limit`,
+or `limit ... exceeded`. If the keyword matches, it is treated as a real rate
+limit if claude exited non-zero, OR -- on exit 0 -- the message matches one of the
 low-false-positive reset-time patterns below (ISO 8601, an IANA-zone date or time,
 or a relative offset phrase). A bare 12-hour clock with no date and no IANA zone
 (e.g. a lone "9:00 PM") is too generic to trust as a standalone signal on a
@@ -633,4 +637,30 @@ SPDX-License-Identifier: GPL-3.0-or-later
       documented the date-less TZ-abbreviation fallback (Fixes 1, 2)
     - Parallel execution section: documented the Fix 4 prompt-abort behavior for
       non-rate-limit exceptions
+    - Activity log section: appended this entry
+
+# line 640
+[2026-06-26T11:26:35+00:00 / 2026-06-26T06:26:35-0500] patch v1.6.2 -> v1.6.3 -- fix rate-limit keyword regex miss on "session limit"
+  autobuilderclaude.py:
+    - Fix: `_RATE_LIMIT_RE`'s first alternative widened from the literal
+      `hit your limit` to `hit your (?:\w+\s+)?limit`, so messages like
+      "You've hit your session limit" (and similarly-worded variants, e.g.
+      "weekly limit") now match the keyword gate. Previously the inserted
+      word broke every alternative in the regex, so `is_limit` evaluated
+      False and the task failed outright instead of sleeping to the
+      already-correctly-parseable reset time.
+    - Discovered when a real run of the syntorx9000 MRSS EEPROM plan's
+      Task 11 hit a Claude Code session limit and exited 1 instead of
+      retrying. Root cause confirmed by reading the regex directly; full
+      detail in autobuilderclaude_activity.log.
+    - Verified via a standalone python3 reproduction: the failing message,
+      the original "hit your limit" message, "weekly limit", "usage limit",
+      "rate limit", "rate-limit", "exceeded ... limit", and "limit ...
+      exceeded" all match; two benign control strings ("hit your stride
+      today", "time limit for this run") still do not match.
+    - `python3 -m py_compile autobuilderclaude.py` succeeds after the fix.
+    - Version bump to v1.6.3 (header comment and argparse description)
+  README.md:
+    - Rate-limit handling section: documented the recognized limit-keyword
+      phrases, including the widened "hit your <word> limit" pattern
     - Activity log section: appended this entry

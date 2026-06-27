@@ -1,3 +1,0 @@
-You've hit your limit · resets May 26, 12pm (America/Chicago)
-
-ERROR: rate limit reached -- You've hit your limit · resets May 26, 12pm (America/Chicago)
