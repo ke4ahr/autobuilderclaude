@@ -250,11 +250,16 @@ non-zero. Five reset-time formats are recognized:
 - ISO 8601 (e.g. `2026-05-22T14:00:00Z`)
 - 12-hour clock with TZ abbreviation, with or without a date (e.g.
   `9:00 PM CDT on Thursday, May 22, 2026` or just `9:00 PM CDT`). When no date is
-  given, today is assumed (or tomorrow, if that time has already passed).
+  given, today is assumed; tomorrow is assumed only if the time passed more than
+  1 hour ago. A reset time that passed within the last hour is treated as the
+  current reset boundary (resulting in an immediate retry rather than a 24-hour
+  wait), guarding against repeated day-rollover when the script wakes slightly
+  late from an earlier rate-limit sleep.
 - Relative offsets (e.g. `retry after 60 seconds`)
 - Date + time + IANA zone (e.g. `May 26, 12pm (America/Chicago)`)
 - Time-only + IANA zone (e.g. `7:20am (America/Chicago)`). When no date is given,
-  today is assumed (or tomorrow, if that time has already passed).
+  today is assumed; tomorrow is assumed only if the time passed more than 1 hour
+  ago (same 1-hour-grace logic as the TZ-abbreviation format above).
 
 If a reset time is found, the script sleeps until (reset_time + 10 minutes)
 and then retries the failing task automatically, up to 3 times:
@@ -663,4 +668,29 @@ SPDX-License-Identifier: GPL-3.0-or-later
   README.md:
     - Rate-limit handling section: documented the recognized limit-keyword
       phrases, including the widened "hit your <word> limit" pattern
+    - Activity log section: appended this entry
+
+[2026-07-02T07:08:45+00:00 / 2026-07-02T02:08:45-0500] patch v1.6.3 -> v1.6.4 -- fix parse_reset_time() date rollover after midnight UTC
+  autobuilderclaude.py:
+    - Fix: changed both time-only branches in parse_reset_time() from
+      `if reset_local <= now_local: reset_local += timedelta(days=1)` to
+      `if reset_local < now_local - timedelta(hours=1): reset_local += timedelta(days=1)`.
+      Affected branches: the 12h+TZ-abbreviation date-less path (line ~236) and
+      the IANA time-only path (line ~307).
+    - Root cause: when the script woke up ~10 minutes after a reset time
+      (e.g., 1:40 AM CDT) and received a second rate-limit message with the
+      same time ("1:30 AM CDT"), the old guard fired because 1:30 AM <= 1:40 AM,
+      adding a full day and scheduling a ~24-hour sleep instead of a short
+      retry. Manifested as the printed restart time showing one calendar day
+      further ahead than expected, visible after midnight UTC (00:00Z) when
+      the CDT local date had not yet rolled over.
+    - Fix behavior: a reset time that just barely passed (within 1 hour)
+      is returned as-is (past UTC time -> sleep_secs = max(0, negative) = 0 ->
+      immediate retry). A reset time that passed more than 1 hour ago is
+      still rolled to the next calendar day, preserving the original behavior
+      for the common first-rate-limit case (e.g., rate-limited at 3:40 PM
+      CDT with a "1:30 AM CDT" reset -> correctly schedules 1:30 AM the
+      next day).
+    - Version bump to v1.6.4 (header comment line 3, argparse description)
+  README.md:
     - Activity log section: appended this entry

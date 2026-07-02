@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.6.3
+# autobuilderclaude v1.6.4
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -229,7 +229,11 @@ def parse_reset_time(message):
                 tz = timezone(timedelta(hours=offset_h))
                 now_local = datetime.now(tz)
                 reset_local = now_local.replace(hour=h, minute=mn, second=sc, microsecond=0)
-                if reset_local <= now_local:
+                # Only roll to the next day if the reset time passed more than
+                # 1 hour ago. A reset time that just barely passed (<= 1h) is
+                # the same boundary the script already waited for; adding a day
+                # would schedule 24h instead of a short retry.
+                if reset_local < now_local - timedelta(hours=1):
                     reset_local += timedelta(days=1)
                 return reset_local.astimezone(timezone.utc)
             except (ValueError, KeyError):
@@ -295,7 +299,11 @@ def parse_reset_time(message):
                     h = 0
                 now_local   = datetime.now(tz)
                 reset_local = now_local.replace(hour=h, minute=mn, second=0, microsecond=0)
-                if reset_local <= now_local:
+                # Only roll to the next day if the reset time passed more than
+                # 1 hour ago. A reset time that just barely passed (<= 1h) is
+                # the same boundary the script already waited for; adding a day
+                # would schedule 24h instead of a short retry.
+                if reset_local < now_local - timedelta(hours=1):
                     reset_local += timedelta(days=1)
                 return reset_local.astimezone(timezone.utc)
             except _ZINotFoundError:
@@ -962,7 +970,7 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.6.3 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.6.4 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
