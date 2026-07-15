@@ -13,7 +13,9 @@ seconds and minutes forms (e.g. `426.7s, 7m6.700s`). On a 429/rate-limit
 response that contains a reset time, the script sleeps until (reset_time
 + 10 minutes) and retries the failing task automatically. Sleeps longer
 than 24 hours are supported; a progress line is printed every 2 hours
-during the wait.
+during the wait. When an invocation runs longer than 29 minutes, exits
+non-zero, and produces no output, it is treated as a hung or crashed run;
+a second such occurrence within the same task's retry loop is fatal.
 
 ## Requirements
 
@@ -284,6 +286,43 @@ rate limit, the run aborts immediately:
 ERROR: rate limit reached -- <message excerpt>
 Remaining tasks skipped.
 ```
+
+## Fatal invocation detection
+
+An invocation is flagged when all three of these conditions hold simultaneously:
+
+- It ran for longer than 29 minutes (measured from `Popen` to `communicate()` return,
+  excluding any rate-limit sleep time between retries)
+- It exited with a non-zero return code
+- It produced no output (stdout is empty after JSON decoding)
+
+The first such occurrence within a task's retry loop emits a warning and allows
+processing to continue:
+
+```
+  WARNING: invocation ran 1758s with no output (strike 1 of 2 before fatal; exit 1)
+```
+
+The second occurrence is fatal: the script prints an error to stderr and exits 1,
+skipping all remaining tasks:
+
+```
+FATAL: invocation ran 1812s (>1740s), exited 1, produced no output (second occurrence -- aborting)
+Remaining tasks skipped.
+```
+
+An additional rule applies when the previous retry was a rate-limit hit: if the
+next attempt then meets the timeout and no-output criteria, it is immediately
+fatal without waiting for a second occurrence:
+
+```
+FATAL: invocation ran 1810s (>1740s), exited 1, produced no output (previous attempt was a rate-limit hit -- aborting)
+Remaining tasks skipped.
+```
+
+This catches the pattern where a task never gets to run (first attempt hits a rate
+limit; second attempt hangs until the session-limit compaction hook fires and claude
+exits non-zero with no output).
 
 ## Log files
 
@@ -692,5 +731,67 @@ SPDX-License-Identifier: GPL-3.0-or-later
       CDT with a "1:30 AM CDT" reset -> correctly schedules 1:30 AM the
       next day).
     - Version bump to v1.6.4 (header comment line 3, argparse description)
+  README.md:
+    - Activity log section: appended this entry
+
+[2026-07-03T18:20:26+00:00 / 2026-07-03T13:20:26-0500] patch v1.6.4 -> v1.6.5 -- fix parse_reset_time() IANA-before-12H ordering
+  autobuilderclaude.py:
+    - Fix: moved _RESET_DATE_IANA_RE and _RESET_TIME_IANA_RE checks to run BEFORE
+      _RESET_12H_RE in parse_reset_time(). For messages like "resets 4:40am
+      (America/Chicago)", the 12H branch had been matching first, defaulting the
+      timezone to UTC (no TZ abbreviation in that group) and scheduling a
+      next-day wakeup. The IANA branch (which correctly extracts
+      America/Chicago = CDT = UTC-5) now runs first; 12H is the fallback for
+      messages with no IANA zone name.
+    - Verified: "4:40am (America/Chicago)" now yields 9:40 AM UTC (correct);
+      old code yielded 4:40 AM UTC next day (wrong).
+    - `python3 -m py_compile autobuilderclaude.py` succeeds.
+    - Version bump to v1.6.5 (header comment line 3, argparse description)
+  README.md:
+    - Activity log section: appended this entry
+
+[2026-07-15T11:28:38+00:00 / 2026-07-15T06:28:38-0500] feature v1.6.5 -> v1.6.6 -- fatal invocation detection
+  autobuilderclaude.py:
+    - Added FatalInvocationError(RuntimeError) class and _FATAL_TIMEOUT_SECS = 29*60
+      constant (1740 seconds)
+    - run_claude(): added _long_no_output_strikes counter and _prev_was_rate_limit
+      flag, both initialized before the retry while loop. After each invocation, if
+      all three hold (elapsed > _FATAL_TIMEOUT_SECS, returncode != 0,
+      text_output.strip() == ""), the counter increments. Strike 1 prints a WARNING
+      and continues; strike 2 raises FatalInvocationError with reason "second
+      occurrence". If _prev_was_rate_limit is True at strike 1, FatalInvocationError
+      is raised immediately with reason "previous attempt was a rate-limit hit".
+      _prev_was_rate_limit is set True in the rate-limit retry branch before continue.
+    - Three catch sites updated in main(): serial task loop, parallel executor
+      loop, and verification block each catch FatalInvocationError, print the
+      message to stderr, and call sys.exit(1).
+    - `python3 -m py_compile autobuilderclaude.py` succeeds.
+    - Version bump to v1.6.6 (header comment line 3, argparse description)
+  README.md:
+    - Intro: added sentence describing fatal invocation detection
+    - Added "Fatal invocation detection" section (before Log files)
+    - Activity log section: appended this entry
+
+[2026-07-15T12:12:30+00:00 / 2026-07-15T07:12:30-0500] patch v1.6.6 -> v1.6.7 -- expert review bug fixes (s374)
+  autobuilderclaude.py:
+    - FatalInvocationError docstring: corrected ">20 min" to ">29 min" (matched _FATAL_TIMEOUT_SECS)
+    - _EXEC_WINDOW_RE: widened IANA zone group from `[A-Za-z_]+/[A-Za-z_]+` to
+      `[A-Za-z_]+(?:/[A-Za-z_]+)+` to match 3-component zones (America/Indiana/Indianapolis etc.)
+    - Added _chunked_sleep(sleep_secs, wake_dt, label, _out) helper; replaced duplicated
+      chunked-sleep loops in wait_for_exec_window and run_claude rate-limit branch with calls to it
+    - wait_for_exec_window: restructured to loop and re-verify window is open after each sleep,
+      guarding against clock skew and DST transitions
+    - load_config_file: added try/except OSError with clean ERROR print + sys.exit(1), matching
+      load_models_file behavior
+    - merge_configs docstring: documented that list-type keys (add_dirs, allowed_tools) are
+      replaced in full; only models is deep-merged
+    - _parse_fields_and_body: added warning to stderr when a line matches `\w+:\s*\S` but is
+      not a recognized field (Model|Files|Effort|ExecWindow) -- indicates typo in plan header
+    - build_prompt: added _license_header_cache module-level dict; license file now read once
+      per path per process, not once per task invocation
+    - proc.communicate(): added KNOWN ISSUE comment explaining no-timeout is intentional;
+      _FATAL_TIMEOUT_SECS only fires post-communicate(); claude CLI manages its own lifecycle
+    - executor.shutdown: wrapped cancel_futures=True in try/except TypeError for Python 3.8 compat
+    - Version bump to v1.6.7 (header comment, argparse description)
   README.md:
     - Activity log section: appended this entry

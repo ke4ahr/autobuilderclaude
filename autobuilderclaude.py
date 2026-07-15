@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.6.4
+# autobuilderclaude v1.6.7
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -154,9 +154,24 @@ class RateLimitError(RuntimeError):
     pass
 
 
+class FatalInvocationError(RuntimeError):
+    """Raised when a claude invocation ran >29 min, exited with error, and produced no output."""
+    pass
+
+
+# Invocations that run longer than this threshold AND exit non-zero AND produce
+# no output are considered suspect. A second such occurrence within the same
+# task's retry loop is fatal. One occurrence is tolerated (may be retried if
+# it is also a rate-limit hit).
+_FATAL_TIMEOUT_SECS = 29 * 60
+
+
 # Tools granted to claude when neither config nor --allowedTools sets a list.
 # Single source of truth for run_claude()'s default and main()'s fallback.
 DEFAULT_ALLOWED_TOOLS = ['Bash', 'Edit', 'Read', 'Write']
+
+# Cache for license file content; populated on first build_prompt() call per path.
+_license_header_cache: dict = {}
 
 
 def parse_reset_time(message):
@@ -164,6 +179,10 @@ def parse_reset_time(message):
     Extract the rate-limit reset datetime from a message string.
     Returns a UTC-aware datetime, or None if no parseable time is found.
     Handles ISO 8601, 12-hour clock with TZ abbreviation, and relative offsets.
+
+    IANA-zone patterns are checked before the bare 12H pattern so that a
+    message like "resets 4:40am (America/Chicago)" is parsed with the correct
+    timezone rather than being misread as 4:40 AM UTC and rolled to next day.
     """
     # ISO 8601: 2026-05-22T14:00:00Z or 2026-05-22T14:00:00-05:00
     m = _RESET_ISO_RE.search(message)
@@ -184,73 +203,8 @@ def parse_reset_time(message):
         except ValueError:
             pass
 
-    # "9:00 PM CDT on Thursday, May 22, 2026"
-    m = _RESET_12H_RE.search(message)
-    if m:
-        time_str   = m.group(1)
-        ampm       = m.group(2).upper()
-        tz_abbr    = (m.group(3) or 'UTC').upper()
-        month_str  = m.group(4)
-        day_str    = m.group(5)
-        year_str   = m.group(6)
-        if month_str and day_str and year_str:
-            month = _MONTH_NAMES.get(month_str.lower())
-            if month:
-                try:
-                    parts = time_str.split(':')
-                    h  = int(parts[0])
-                    mn = int(parts[1]) if len(parts) > 1 else 0
-                    sc = int(parts[2]) if len(parts) > 2 else 0
-                    if ampm == 'PM' and h != 12:
-                        h += 12
-                    elif ampm == 'AM' and h == 12:
-                        h = 0
-                    dt = datetime(int(year_str), month, int(day_str), h, mn, sc)
-                    offset_h = _TZ_OFFSETS.get(tz_abbr, 0)
-                    tz = timezone(timedelta(hours=offset_h))
-                    return dt.replace(tzinfo=tz).astimezone(timezone.utc)
-                except (ValueError, KeyError):
-                    pass
-        else:
-            # "9:00 PM CDT" -- TZ abbreviation but no date. Assume today (or
-            # tomorrow if that time has already passed) in the abbreviation's
-            # fixed UTC offset, the same fallback logic as the IANA-zone,
-            # date-less branch below.
-            try:
-                parts = time_str.split(':')
-                h  = int(parts[0])
-                mn = int(parts[1]) if len(parts) > 1 else 0
-                sc = int(parts[2]) if len(parts) > 2 else 0
-                if ampm == 'PM' and h != 12:
-                    h += 12
-                elif ampm == 'AM' and h == 12:
-                    h = 0
-                offset_h = _TZ_OFFSETS.get(tz_abbr, 0)
-                tz = timezone(timedelta(hours=offset_h))
-                now_local = datetime.now(tz)
-                reset_local = now_local.replace(hour=h, minute=mn, second=sc, microsecond=0)
-                # Only roll to the next day if the reset time passed more than
-                # 1 hour ago. A reset time that just barely passed (<= 1h) is
-                # the same boundary the script already waited for; adding a day
-                # would schedule 24h instead of a short retry.
-                if reset_local < now_local - timedelta(hours=1):
-                    reset_local += timedelta(days=1)
-                return reset_local.astimezone(timezone.utc)
-            except (ValueError, KeyError):
-                pass
-
-    # "retry after 60 seconds" / "reset in 5 minutes"
-    m = _RESET_RELATIVE_RE.search(message)
-    if m:
-        amount = int(m.group(1))
-        unit   = m.group(2).lower()
-        if unit.startswith('second'):
-            delta = timedelta(seconds=amount)
-        elif unit.startswith('minute'):
-            delta = timedelta(minutes=amount)
-        else:
-            delta = timedelta(hours=amount)
-        return datetime.now(timezone.utc) + delta
+    # IANA-zone patterns checked before bare 12H to avoid misreading
+    # "4:40am (America/Chicago)" as 4:40 AM UTC.
 
     # "May 26, 12pm (America/Chicago)" -- month+day + time + IANA zone name
     if _HAVE_ZONEINFO:
@@ -309,6 +263,74 @@ def parse_reset_time(message):
             except _ZINotFoundError:
                 pass
 
+    # "9:00 PM CDT on Thursday, May 22, 2026" -- bare 12H with TZ abbreviation or date
+    m = _RESET_12H_RE.search(message)
+    if m:
+        time_str   = m.group(1)
+        ampm       = m.group(2).upper()
+        tz_abbr    = (m.group(3) or 'UTC').upper()
+        month_str  = m.group(4)
+        day_str    = m.group(5)
+        year_str   = m.group(6)
+        if month_str and day_str and year_str:
+            month = _MONTH_NAMES.get(month_str.lower())
+            if month:
+                try:
+                    parts = time_str.split(':')
+                    h  = int(parts[0])
+                    mn = int(parts[1]) if len(parts) > 1 else 0
+                    sc = int(parts[2]) if len(parts) > 2 else 0
+                    if ampm == 'PM' and h != 12:
+                        h += 12
+                    elif ampm == 'AM' and h == 12:
+                        h = 0
+                    dt = datetime(int(year_str), month, int(day_str), h, mn, sc)
+                    offset_h = _TZ_OFFSETS.get(tz_abbr, 0)
+                    tz = timezone(timedelta(hours=offset_h))
+                    return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+                except (ValueError, KeyError):
+                    pass
+        else:
+            # "9:00 PM CDT" -- TZ abbreviation but no date. Assume today (or
+            # tomorrow if that time has already passed) in the abbreviation's
+            # fixed UTC offset, the same fallback logic as the IANA-zone,
+            # date-less branch above.
+            try:
+                parts = time_str.split(':')
+                h  = int(parts[0])
+                mn = int(parts[1]) if len(parts) > 1 else 0
+                sc = int(parts[2]) if len(parts) > 2 else 0
+                if ampm == 'PM' and h != 12:
+                    h += 12
+                elif ampm == 'AM' and h == 12:
+                    h = 0
+                offset_h = _TZ_OFFSETS.get(tz_abbr, 0)
+                tz = timezone(timedelta(hours=offset_h))
+                now_local = datetime.now(tz)
+                reset_local = now_local.replace(hour=h, minute=mn, second=sc, microsecond=0)
+                # Only roll to the next day if the reset time passed more than
+                # 1 hour ago. A reset time that just barely passed (<= 1h) is
+                # the same boundary the script already waited for; adding a day
+                # would schedule 24h instead of a short retry.
+                if reset_local < now_local - timedelta(hours=1):
+                    reset_local += timedelta(days=1)
+                return reset_local.astimezone(timezone.utc)
+            except (ValueError, KeyError):
+                pass
+
+    # "retry after 60 seconds" / "reset in 5 minutes"
+    m = _RESET_RELATIVE_RE.search(message)
+    if m:
+        amount = int(m.group(1))
+        unit   = m.group(2).lower()
+        if unit.startswith('second'):
+            delta = timedelta(seconds=amount)
+        elif unit.startswith('minute'):
+            delta = timedelta(minutes=amount)
+        else:
+            delta = timedelta(hours=amount)
+        return datetime.now(timezone.utc) + delta
+
     return None
 
 
@@ -317,7 +339,7 @@ def parse_reset_time(message):
 # ---------------------------------------------------------------------------
 
 _EXEC_WINDOW_RE = re.compile(
-    r'^\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*(?:([A-Za-z_]+/[A-Za-z_]+)|([A-Za-z]{2,4}))?\s*$'
+    r'^\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*(?:([A-Za-z_]+(?:/[A-Za-z_]+)+)|([A-Za-z]{2,4}))?\s*$'
 )
 
 
@@ -383,23 +405,8 @@ def _next_exec_window_start(now_utc, window):
     return candidate.astimezone(timezone.utc)
 
 
-def wait_for_exec_window(windows, _out):
-    """
-    Block until current time falls within one of the given windows.
-    No-op if windows is empty (unrestricted). Prints progress every
-    _SLEEP_REPORT_INTERVAL seconds, matching the rate-limit sleep style.
-    """
-    if not windows:
-        return
-    now = datetime.now(timezone.utc)
-    if any(_in_exec_window(now, w) for w in windows):
-        return
-    wake_dt = min(_next_exec_window_start(now, w) for w in windows)
-    sleep_secs = max(0.0, (wake_dt - now).total_seconds())
-    _out(
-        f'  Exec window closed -- next window opens '
-        f'{wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")}; sleeping {sleep_secs:.0f}s'
-    )
+def _chunked_sleep(sleep_secs, wake_dt, label, _out):
+    """Sleep sleep_secs seconds, printing a progress line every _SLEEP_REPORT_INTERVAL seconds."""
     remaining = sleep_secs
     while remaining > 0:
         chunk = min(remaining, _SLEEP_REPORT_INTERVAL)
@@ -408,9 +415,35 @@ def wait_for_exec_window(windows, _out):
         if remaining > 0:
             still_left = max(0.0, (wake_dt - datetime.now(timezone.utc)).total_seconds())
             _out(
-                f'  Exec window sleep -- {still_left:.0f}s remaining '
+                f'  {label} -- {still_left:.0f}s remaining '
                 f'(wake {wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")})'
             )
+
+
+def wait_for_exec_window(windows, _out):
+    """
+    Block until current time falls within one of the given windows.
+    No-op if windows is empty (unrestricted). Prints progress every
+    _SLEEP_REPORT_INTERVAL seconds. Re-checks the window after each sleep
+    to guard against clock skew and DST transitions.
+    """
+    if not windows:
+        return
+    now = datetime.now(timezone.utc)
+    if any(_in_exec_window(now, w) for w in windows):
+        return
+    while True:
+        now = datetime.now(timezone.utc)
+        wake_dt = min(_next_exec_window_start(now, w) for w in windows)
+        sleep_secs = max(0.0, (wake_dt - now).total_seconds())
+        _out(
+            f'  Exec window closed -- next window opens '
+            f'{wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")}; sleeping {sleep_secs:.0f}s'
+        )
+        _chunked_sleep(sleep_secs, wake_dt, 'Exec window sleep', _out)
+        now = datetime.now(timezone.utc)
+        if any(_in_exec_window(now, w) for w in windows):
+            break
     _out('  Exec window open -- proceeding.')
 
 
@@ -445,8 +478,12 @@ def load_plan_config(plan_text):
 
 def load_config_file(path):
     _require_yaml()
-    with open(path, encoding='utf-8') as f:
-        return yaml.safe_load(f) or {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            return yaml.safe_load(f) or {}
+    except OSError as e:
+        print(f'ERROR: cannot read config: {e}', file=sys.stderr)
+        sys.exit(1)
 
 
 def load_models_file(path):
@@ -472,7 +509,12 @@ def load_models_file(path):
 
 
 def merge_configs(plan_cfg, file_cfg):
-    """file_cfg values override plan_cfg values."""
+    """file_cfg values override plan_cfg values.
+
+    List-type keys (add_dirs, allowed_tools) are replaced in full -- not
+    appended. Only the models dict is deep-merged so partial alias overrides
+    work without clobbering aliases defined in the other source.
+    """
     merged = dict(plan_cfg)
     merged.update(file_cfg)
     # Deep-merge the models dict so partial overrides work.
@@ -594,8 +636,13 @@ def _parse_fields_and_body(section_text):
             field_end = i + 1
             break
         else:
-            # First non-field, non-comment, non-blank line starts the prompt body
-            # right here -- no skip, no distance heuristic.
+            # Warn if this looks like a field with an unrecognized key.
+            if re.match(r'^\w+:\s*\S', line):
+                print(
+                    f'WARNING: unrecognized field in plan -- treated as prompt body: {line!r}',
+                    file=sys.stderr,
+                )
+            # First non-field, non-comment, non-blank line starts the prompt body.
             field_end = i
             break
 
@@ -740,13 +787,19 @@ def build_prompt(task_dict, config):
 
     license_file = str(config.get('license_file') or '').strip()
     if license_file and license_file.lower() not in ('null', 'none'):
-        try:
-            header = Path(license_file).read_text(encoding='utf-8').rstrip()
+        if license_file not in _license_header_cache:
+            try:
+                _license_header_cache[license_file] = (
+                    Path(license_file).read_text(encoding='utf-8').rstrip()
+                )
+            except OSError as e:
+                print(f'WARNING: cannot read license_file {license_file}: {e}', file=sys.stderr)
+                _license_header_cache[license_file] = None
+        header = _license_header_cache[license_file]
+        if header is not None:
             parts.append(
                 'Use this exact license header for all new Python files:\n\n' + header
             )
-        except OSError as e:
-            print(f'WARNING: cannot read license_file {license_file}: {e}', file=sys.stderr)
 
     if parts:
         parts.append('')  # blank line before prompt body
@@ -844,6 +897,8 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
 
     cmd = claude_cmd
 
+    _long_no_output_strikes = 0
+    _prev_was_rate_limit = False
     attempt = 0
     while True:
         attempt += 1
@@ -859,6 +914,10 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
             text=True,
             encoding='utf-8',
         )
+        # KNOWN ISSUE: proc.communicate() has no timeout. A subprocess that
+        # never exits blocks this thread indefinitely. _FATAL_TIMEOUT_SECS
+        # only fires AFTER communicate() returns. Desired behavior: let the
+        # claude CLI manage its own lifecycle; no hard kill from this script.
         raw, err = proc.communicate(input=prompt)
         elapsed = time.monotonic() - t0
 
@@ -887,6 +946,28 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         )
         _out(f'  output tokens: {tok_out}')
         _out(text_output)
+
+        # All three conditions must hold: process ran >29 min, exited non-zero,
+        # and produced no output. One such occurrence is tolerated (the attempt
+        # may still be retried if it is also a rate-limit hit). A second
+        # occurrence within the same task's retry loop is fatal.
+        if elapsed > _FATAL_TIMEOUT_SECS and proc.returncode != 0 and not text_output.strip():
+            _long_no_output_strikes += 1
+            if _long_no_output_strikes >= 2 or _prev_was_rate_limit:
+                reason = (
+                    'previous attempt was a rate-limit hit'
+                    if _prev_was_rate_limit
+                    else 'second occurrence'
+                )
+                raise FatalInvocationError(
+                    f'invocation ran {elapsed:.0f}s (>{_FATAL_TIMEOUT_SECS}s), '
+                    f'exited {proc.returncode}, produced no output '
+                    f'({reason} -- aborting)'
+                )
+            _out(
+                f'  WARNING: invocation ran {elapsed:.0f}s with no output '
+                f'(strike 1 of 2 before fatal; exit {proc.returncode})'
+            )
 
         # text_output has the decoded human-readable result (JSON unescaped);
         # search it first so natural-language time patterns resolve correctly.
@@ -920,18 +1001,9 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
                     f'sleeping {sleep_secs:.0f}s '
                     f'(wake {wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")})'
                 )
-                remaining = sleep_secs
-                while remaining > 0:
-                    chunk = min(remaining, _SLEEP_REPORT_INTERVAL)
-                    time.sleep(chunk)
-                    remaining -= chunk
-                    if remaining > 0:
-                        still_left = max(0.0, (wake_dt - datetime.now(timezone.utc)).total_seconds())
-                        _out(
-                            f'  Rate limit sleep -- {still_left:.0f}s remaining '
-                            f'(wake {wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")})'
-                        )
+                _chunked_sleep(sleep_secs, wake_dt, 'Rate limit sleep', _out)
                 _out('  Retrying ...')
+                _prev_was_rate_limit = True
                 continue
             raise RateLimitError(text_output.strip()[:300])
 
@@ -970,7 +1042,7 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.6.4 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.6.7 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
@@ -1206,6 +1278,11 @@ def main():
             for future in as_completed(futures):
                 try:
                     task_num, rc, usage, lines = future.result()
+                except FatalInvocationError as e:
+                    with print_lock:
+                        print(f'\nFATAL: {e}', file=sys.stderr)
+                        print('Remaining tasks skipped.', file=sys.stderr)
+                    sys.exit(1)
                 except RateLimitError as e:
                     with print_lock:
                         print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
@@ -1215,7 +1292,11 @@ def main():
                     print('\n'.join(lines))
                 _accumulate(rc, usage, task_num)
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # cancel_futures added in Python 3.9; fall back on 3.8.
+                executor.shutdown(wait=False)
     else:
         for task in selected:
             model_key = args.model or task['model'] or default_model
@@ -1239,6 +1320,10 @@ def main():
             prompt = build_prompt(task, config)
             try:
                 rc, usage = run_claude(prompt, model, args.dry_run, log_dir, label, add_dirs, allowed_tools_list, task_claude_args, exec_windows=exec_windows)
+            except FatalInvocationError as e:
+                print(f'\nFATAL: {e}', file=sys.stderr)
+                print('Remaining tasks skipped.', file=sys.stderr)
+                sys.exit(1)
             except RateLimitError as e:
                 print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
                 print('Remaining tasks skipped.', file=sys.stderr)
@@ -1265,6 +1350,9 @@ def main():
         prompt = build_prompt(verification, config)
         try:
             rc, usage = run_claude(prompt, model, args.dry_run, log_dir, 'verify', add_dirs, allowed_tools_list, verify_claude_args, exec_windows=exec_windows)
+        except FatalInvocationError as e:
+            print(f'\nFATAL: {e}', file=sys.stderr)
+            sys.exit(1)
         except RateLimitError as e:
             print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
             sys.exit(1)
