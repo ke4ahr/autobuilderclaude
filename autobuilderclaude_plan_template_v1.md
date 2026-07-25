@@ -63,7 +63,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
               (falls back to default_model from Build Config / --config if omitted)
       Files:  path/relative/to/repo [, path2, path3]
       Effort: low | medium | high | xhigh | max
-      ExecWindow: HH:MM-HH:MM [TZ] [; HH:MM-HH:MM [TZ] ...]
+      ExecWindow: [DAY[,DAY...] ]HH:MM-HH:MM [TZ] [; [DAY[,DAY...] ]HH:MM-HH:MM [TZ] ...]
     "haiku", "sonnet", "opus" resolve via models aliases in Build Config or
     config file. A full model ID (e.g. nvidia/nemotron-3-super-120b-a12b:free)
     is passed directly to the claude CLI. OpenRouter models require
@@ -71,10 +71,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
     in the environment. A command-line --model flag overrides the per-task field.
     Effort: overrides the config effort key for that task; a command-line --effort
     flag is a global override that takes precedence over all per-task Effort: fields.
-    ExecWindow: restricts when this task may run. TZ is an IANA zone
-    (America/Chicago) or abbreviation (CDT/CST/UTC); omitted TZ defaults to UTC.
-    start>end wraps past midnight (22:00-06:00). Multiple windows separated by
-    ";". The task blocks (sleeping in wait increments) until inside a window.
+    ExecWindow: restricts when this task may run. Format per entry:
+    "[DAY[,DAY...] ]HH:MM-HH:MM [TZ]"; entries separated by ";".
+    TZ is an IANA zone (America/Chicago) or abbreviation (CDT/CST/UTC).
+    start>end wraps past midnight. Day abbreviations (case-insensitive):
+    Mo Tu We Th Fr Sa Su -- omit for all days (existing behavior).
+    Examples:
+      "Sa,Su 00:00-00:00 America/Chicago"               -- all day Sat+Sun
+      "Tu,Th 18:00-06:00 America/Chicago"               -- Tue+Thu nights (wraps midnight)
+      "Mo,Tu,We,Th,Fr 17:00-08:00 CDT; Sa,Su 00:00-00:00 CDT" -- weeknights + all weekend
     Overrides the config exec_window key for that task. No command-line override
     exists for this field.
 

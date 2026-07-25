@@ -88,15 +88,18 @@ default_model: sonnet
 effort: null
 
 # Default allowed execution time window, applied to every task that has no
-# per-task ExecWindow: field. Format: "HH:MM-HH:MM [TZ]", semicolon-separated
-# for multiple windows. TZ is an IANA zone (America/Chicago) or abbreviation
+# per-task ExecWindow: field. Format per entry: "[DAY[,DAY...] ]HH:MM-HH:MM [TZ]",
+# entries separated by ";". TZ is an IANA zone (America/Chicago) or abbreviation
 # (CDT/CST/UTC); omitted TZ defaults to UTC. start>end wraps past midnight.
+# Day abbreviations (case-insensitive): Mo Tu We Th Fr Sa Su -- omit for all days.
 # A task blocks (sleeping in wait increments) until inside a window.
 # Set to null or omit for unrestricted (tasks run anytime). No command-line
 # override exists for this setting.
 exec_window: null
 # exec_window: "22:00-06:00 America/Chicago"
-# exec_window: "00:00-06:00 UTC; 12:00-13:00 UTC"
+# exec_window: "Sa,Su 00:00-00:00 America/Chicago"
+# exec_window: "Tu,Th 18:00-06:00 America/Chicago"
+# exec_window: "Mo,Tu,We,Th,Fr 17:00-08:00 America/Chicago; Sa,Su 00:00-00:00 America/Chicago"
 
 # ---------------------------------------------------------------------------
 # Additional models file (optional)

@@ -168,6 +168,7 @@ Copy it, fill in real paths, and pass it via `--template` or `--config`.
 | `allowed_tools` | List of tools passed via `--allowedTools`. Set to `null` or omit to use the built-in default: `['Bash', 'Edit', 'Read', 'Write']`. Include `mcp__GhidraMCP__*` (or other `mcp__*` entries) explicitly if a task needs MCP tool access -- it is not granted by the default. |
 | `default_model` | Model alias used when a task has no `Model:` field. Default: `sonnet`. |
 | `effort` | Default effort level for claude (`low`/`medium`/`high`/`xhigh`/`max`). Overridden by a task's `Effort:` field or by CLI `--effort`. Omit for claude's default. |
+| `exec_window` | Restrict execution to specific days and/or times. Format per entry: `[DAY[,DAY...] ]HH:MM-HH:MM [TZ]`; entries separated by `;`. Day abbreviations (case-insensitive): `Mo Tu We Th Fr Sa Su`; omit for all days. `start>end` wraps past midnight. TZ is an IANA zone or abbreviation; omitted TZ defaults to UTC. `null`/omit for unrestricted. Overridden per task by `ExecWindow:` field. See [Execution windows](#execution-windows). |
 | `models` | Dict mapping `haiku`/`sonnet`/`opus` aliases to full model IDs. |
 
 `models`, `add_dirs`, and `allowed_tools` are type-checked at startup: `null`/omitted
@@ -233,6 +234,45 @@ Done.  total tokens: in=5432 out=2109 cache_read=1780 cache_write=0
 
 Fields: `in` = input tokens, `out` = output tokens, `cache_read` = tokens
 read from prompt cache, `cache_write` = tokens written to prompt cache.
+
+## Execution windows
+
+The `exec_window` config key (and per-task `ExecWindow:` field) restrict when tasks
+may run. Outside a window the script sleeps until the next window opens, then resumes.
+This sleep loop re-runs after any rate-limit retry wake-up as well.
+
+### Format
+
+```
+[DAY[,DAY...] ]HH:MM-HH:MM [TZ] [; [DAY[,DAY...] ]HH:MM-HH:MM [TZ] ...]
+```
+
+- **Day prefix** (optional): comma-separated 2-3 letter abbreviations (case-insensitive).
+  `Mo Tu We Th Fr Sa Su` (also `Mon Tue Wed Thu Fri Sat Sun`).
+  Omit to allow all days (backward-compatible with existing specs).
+- **Time range**: `HH:MM-HH:MM`. `start > end` wraps past midnight (e.g. `18:00-06:00`
+  is open from 18:00 until 06:00 the following morning).
+- **TZ**: IANA zone (`America/Chicago`) or abbreviation (`CDT`/`CST`/`UTC`).
+  Defaults to UTC if omitted.
+- **Multiple entries**: separated by `;`.
+
+### Wrapping windows with day filter
+
+When `start > end` and a day filter is set, the window is open when:
+- The current local day is in the day filter AND the time is >= start, OR
+- The current local day is the day AFTER a day in the filter AND the time is < end.
+
+Example: `Tu,Th 18:00-06:00 America/Chicago` -- open Tuesday 18:00 through Wednesday
+06:00 AND Thursday 18:00 through Friday 06:00.
+
+### Examples
+
+| Spec | Meaning |
+|------|---------|
+| `17:00-08:00 America/Chicago` | Overnight every day (existing format) |
+| `Sa,Su 00:00-00:00 America/Chicago` | All day Saturday + Sunday |
+| `Tu,Th 18:00-06:00 America/Chicago` | Tuesday and Thursday nights, wrapping to Wed/Fri 06:00 |
+| `Mo,Tu,We,Th,Fr 17:00-08:00 CDT; Sa,Su 00:00-00:00 CDT` | Weeknights + all weekend |
 
 ## Rate-limit handling
 
@@ -795,3 +835,25 @@ SPDX-License-Identifier: GPL-3.0-or-later
     - Version bump to v1.6.7 (header comment, argparse description)
   README.md:
     - Activity log section: appended this entry
+
+# line 797
+[2026-07-25T19:40:02+00:00 / 2026-07-25T14:40:02-0500] feature v1.6.7 -> v1.6.8 -- day-of-week exec_window filter
+  autobuilderclaude.py:
+    - Added _DAY_NAMES dict: maps 2- and 3-letter day abbreviations (Mo/Mon..Su/Sun)
+      to Python weekday() ints (Mon=0, Sun=6)
+    - Added _DAY_PREFIX_RE: matches optional "DAY[,DAY...] " prefix before HH:MM-HH:MM
+    - parse_exec_windows: strips day prefix via _DAY_PREFIX_RE; parses day set into
+      frozenset; adds 'days' key to each window dict (None = all days)
+    - _in_exec_window: redesigned -- full-day (start==end), non-wrapping, and wrapping
+      cases all check day filter; wrapping case checks prev_weekday for closing side
+    - _next_exec_window_start: added day-advance loop (max 7 steps) after computing
+      initial candidate; guarantees landing on an allowed weekday
+    - Header comment: updated exec_window format to "[DAY[,DAY...] ]HH:MM-HH:MM [TZ]"
+    - Version bump to v1.6.8 (header comment, argparse description)
+  autobuilderclaude_plan_template_v1.md: updated ExecWindow: docs + examples
+  autobuilderclaude_config_v1.yaml: added day-of-week exec_window comment examples
+  README.md: added "Execution windows" section; added exec_window row to Config keys table
+  New spec format: "[DAY[,DAY...] ]HH:MM-HH:MM [TZ]"
+  Examples: "Sa,Su 00:00-00:00 America/Chicago"; "Tu,Th 18:00-06:00 America/Chicago"
+
+[2026-07-25T19:54:17+00:00 / 2026-07-25T14:54:17-0500] verify v1.6.8 complete -- 8 unit tests PASSED; py_compile OK; --list dry-run PASSED (plan_0007 all tasks show unrestricted)

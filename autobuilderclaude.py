@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.6.7
+# autobuilderclaude v1.6.8
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -29,10 +29,12 @@
 # the failing task automatically. Sleeps longer than 24 hours are supported;
 # a progress line is printed every 2 hours during the wait.
 #
-# Tasks may also be restricted to specific time-of-day execution windows via
-# a plan "ExecWindow:" field or a config "exec_window:" key
-# (format: "HH:MM-HH:MM [TZ]", multiple windows separated by ";"). Outside
-# the window, the script sleeps until the window opens before each attempt,
+# Tasks may also be restricted to specific day-of-week and/or time-of-day
+# execution windows via a plan "ExecWindow:" field or a config "exec_window:" key.
+# Format per entry: "[DAY[,DAY...] ]HH:MM-HH:MM [TZ]"; multiple entries separated by ";".
+# Day abbreviations: Mo Tu We Th Fr Sa Su (case-insensitive). Omit days for all days.
+# Example: "Tu,Th 18:00-06:00 America/Chicago" -- Tue+Thu nights 18:00-06:00.
+# Outside the window, the script sleeps until the window opens before each attempt,
 # including attempts after a rate-limit retry wake-up. Per-task ExecWindow:
 # overrides the config default; omit both for unrestricted execution.
 #
@@ -342,16 +344,31 @@ _EXEC_WINDOW_RE = re.compile(
     r'^\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*(?:([A-Za-z_]+(?:/[A-Za-z_]+)+)|([A-Za-z]{2,4}))?\s*$'
 )
 
+# Day-of-week abbreviations -> Python weekday() int (Mon=0, Sun=6).
+_DAY_NAMES = {
+    'mo': 0, 'mon': 0,
+    'tu': 1, 'tue': 1,
+    'we': 2, 'wed': 2,
+    'th': 3, 'thu': 3,
+    'fr': 4, 'fri': 4,
+    'sa': 5, 'sat': 5,
+    'su': 6, 'sun': 6,
+}
+
+# Optional day-of-week prefix before the HH:MM-HH:MM time portion, e.g. "Sa,Su ".
+_DAY_PREFIX_RE = re.compile(r'^([A-Za-z]{2,3}(?:,[A-Za-z]{2,3})*)\s+')
+
 
 def parse_exec_windows(spec):
     """
     Parse an exec-window spec string into a list of window dicts:
-      { start: (h, m), end: (h, m), tz: tzinfo }
+      { start: (h, m), end: (h, m), tz: tzinfo, days: frozenset|None }
     Multiple windows are separated by ';'. Each window:
-      HH:MM-HH:MM [IANA/Zone | TZABBR]
+      [DAY[,DAY...] ]HH:MM-HH:MM [IANA/Zone | TZABBR]
+    Day abbreviations (case-insensitive): Mo Tu We Th Fr Sa Su (also Mon-Sun).
     A window where start > end wraps past midnight (e.g. 22:00-06:00).
-    tz defaults to UTC if omitted. Returns [] for an empty/None spec,
-    meaning no restriction -- always allowed.
+    tz defaults to UTC if omitted. days=None means all days (backward-compatible).
+    Returns [] for an empty/None spec, meaning no restriction -- always allowed.
     """
     windows = []
     if not spec:
@@ -360,6 +377,22 @@ def parse_exec_windows(spec):
         part = part.strip()
         if not part:
             continue
+        days = None
+        dm = _DAY_PREFIX_RE.match(part)
+        if dm:
+            day_set = set()
+            bad = False
+            for d in dm.group(1).split(','):
+                n = _DAY_NAMES.get(d.lower())
+                if n is None:
+                    print(f'WARNING: unrecognized day abbreviation "{d}" in exec-window "{part}" -- ignoring window', file=sys.stderr)
+                    bad = True
+                    break
+                day_set.add(n)
+            if bad:
+                continue
+            days = frozenset(day_set)
+            part = part[dm.end():]
         m = _EXEC_WINDOW_RE.match(part)
         if not m:
             print(f'WARNING: cannot parse exec-window "{part}" -- ignoring', file=sys.stderr)
@@ -376,22 +409,37 @@ def parse_exec_windows(spec):
         if tz is None:
             offset_h = _TZ_OFFSETS.get((tz_name or 'UTC').upper(), 0)
             tz = timezone(timedelta(hours=offset_h))
-        windows.append({'start': (sh, sm), 'end': (eh, em), 'tz': tz})
+        windows.append({'start': (sh, sm), 'end': (eh, em), 'tz': tz, 'days': days})
     return windows
 
 
 def _in_exec_window(now_utc, window):
     local = now_utc.astimezone(window['tz'])
+    days = window.get('days')
     start_h, start_m = window['start']
     end_h, end_m = window['end']
     start_minutes = start_h * 60 + start_m
     end_minutes   = end_h * 60 + end_m
     cur_minutes   = local.hour * 60 + local.minute
+    cur_weekday   = local.weekday()
+
     if start_minutes == end_minutes:
-        return True  # full-day window
+        return days is None or cur_weekday in days
+
     if start_minutes < end_minutes:
+        if days is not None and cur_weekday not in days:
+            return False
         return start_minutes <= cur_minutes < end_minutes
-    return cur_minutes >= start_minutes or cur_minutes < end_minutes  # wraps midnight
+
+    # Wrapping window (start > end, e.g. 18:00-06:00):
+    # open if today is an opening day and time >= start,
+    # or today is the day after an opening day and time < end.
+    if cur_minutes >= start_minutes:
+        return days is None or cur_weekday in days
+    if cur_minutes < end_minutes:
+        prev_weekday = (cur_weekday - 1) % 7
+        return days is None or prev_weekday in days
+    return False
 
 
 def _next_exec_window_start(now_utc, window):
@@ -402,6 +450,12 @@ def _next_exec_window_start(now_utc, window):
     candidate = local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
     if candidate <= local:
         candidate += timedelta(days=1)
+    days = window.get('days')
+    if days is not None:
+        for _ in range(7):
+            if candidate.weekday() in days:
+                break
+            candidate += timedelta(days=1)
     return candidate.astimezone(timezone.utc)
 
 
@@ -1042,7 +1096,7 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.6.7 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.6.8 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
