@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.6.8
+# autobuilderclaude v1.6.9
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -100,7 +100,12 @@ DEFAULT_MODEL_IDS = {
 # ---------------------------------------------------------------------------
 
 _RATE_LIMIT_RE = re.compile(
-    r'hit your (?:\w+\s+)?limit|usage limit|rate.?limit|exceeded.*limit|limit.*exceeded',
+    r'hit your (?:\w+\s+){0,3}limit|usage limit|rate.?limit|exceeded.*limit|limit.*exceeded',
+    re.IGNORECASE,
+)
+
+_SPEND_LIMIT_RE = re.compile(
+    r'monthly\s+spend\s+limit|spend\s+limit.*claude\.ai/settings',
     re.IGNORECASE,
 )
 
@@ -153,6 +158,11 @@ _MONTH_NAMES = {
 
 class RateLimitError(RuntimeError):
     """Raised when the claude CLI output indicates a usage-rate limit."""
+    pass
+
+
+class SpendLimitError(RateLimitError):
+    """Raised when the monthly account spend limit is reached (not retryable)."""
     pass
 
 
@@ -998,6 +1008,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
             f'  ({elapsed:.1f}s, {int(elapsed) // 60}m{elapsed % 60:.3f}s, exit {proc.returncode})'
             f'  tokens: in={tok_in} out={tok_out} cache_read={tok_cr} cache_write={tok_cw}'
         )
+        _out(f'Return code: claude[{proc.pid}]: {proc.returncode}')
         _out(f'  output tokens: {tok_out}')
         _out(text_output)
 
@@ -1026,6 +1037,12 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         # text_output has the decoded human-readable result (JSON unescaped);
         # search it first so natural-language time patterns resolve correctly.
         combined = text_output + '\n' + raw + '\n' + err
+
+        if _SPEND_LIMIT_RE.search(combined):
+            raise SpendLimitError(
+                (text_output.strip() or 'monthly spend limit reached')[:300]
+            )
+
         # Require the rate-limit keyword regardless of signal source, so a
         # successful response that merely echoes a time+timezone string
         # cannot false-positive. Exit code != 0 OR a specific, low-false-
@@ -1096,7 +1113,7 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
 def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.6.8 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.6.9 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
@@ -1337,6 +1354,12 @@ def main():
                         print(f'\nFATAL: {e}', file=sys.stderr)
                         print('Remaining tasks skipped.', file=sys.stderr)
                     sys.exit(1)
+                except SpendLimitError as e:
+                    with print_lock:
+                        print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
+                        print('Raise it at claude.ai/settings/usage', file=sys.stderr)
+                        print('Remaining tasks skipped.', file=sys.stderr)
+                    sys.exit(1)
                 except RateLimitError as e:
                     with print_lock:
                         print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
@@ -1378,6 +1401,11 @@ def main():
                 print(f'\nFATAL: {e}', file=sys.stderr)
                 print('Remaining tasks skipped.', file=sys.stderr)
                 sys.exit(1)
+            except SpendLimitError as e:
+                print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
+                print('Raise it at claude.ai/settings/usage', file=sys.stderr)
+                print('Remaining tasks skipped.', file=sys.stderr)
+                sys.exit(1)
             except RateLimitError as e:
                 print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
                 print('Remaining tasks skipped.', file=sys.stderr)
@@ -1406,6 +1434,10 @@ def main():
             rc, usage = run_claude(prompt, model, args.dry_run, log_dir, 'verify', add_dirs, allowed_tools_list, verify_claude_args, exec_windows=exec_windows)
         except FatalInvocationError as e:
             print(f'\nFATAL: {e}', file=sys.stderr)
+            sys.exit(1)
+        except SpendLimitError as e:
+            print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
+            print('Raise it at claude.ai/settings/usage', file=sys.stderr)
             sys.exit(1)
         except RateLimitError as e:
             print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
