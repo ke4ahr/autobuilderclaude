@@ -11,7 +11,7 @@ are captured to timestamped log files. Token usage is reported per task
 and as a run total. Each task is timed; elapsed time is printed in both
 seconds and minutes forms (e.g. `426.7s, 7m6.700s`). On a 429/rate-limit
 response that contains a reset time, the script sleeps until (reset_time
-+ 10 minutes) and retries the failing task automatically. Sleeps longer
++ 1 minute) and retries the failing task automatically. Sleeps longer
 than 24 hours are supported; a progress line is printed every 2 hours
 during the wait. When an invocation runs longer than 29 minutes, exits
 non-zero, and produces no output, it is treated as a hung or crashed run;
@@ -320,7 +320,7 @@ non-zero. Five reset-time formats are recognized:
   today is assumed; tomorrow is assumed only if the time passed more than 5 hours
   ago (same 5-hour-grace logic as the TZ-abbreviation format above).
 
-If a reset time is found, the script sleeps until (reset_time + 10 minutes)
+If a reset time is found, the script sleeps until (reset_time + 1 minute)
 and then retries the failing task automatically, up to 3 times:
 
 ```
