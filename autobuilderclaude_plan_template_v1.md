@@ -152,7 +152,7 @@ default_model: sonnet
 models:
   haiku:  claude-haiku-4-5-20251001
   sonnet: claude-sonnet-4-6
-  opus:   claude-opus-4-6
+  opus:   claude-opus-4-7
   # Short alias example for an OpenRouter model:
   # nemotron: nvidia/nemotron-3-super-120b-a12b:free
 ```

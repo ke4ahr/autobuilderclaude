@@ -124,7 +124,7 @@ models_file: null
 models:
   haiku:  claude-haiku-4-5-20251001
   sonnet: claude-sonnet-4-6
-  opus:   claude-opus-4-6
+  opus:   claude-opus-4-7
   # Example short aliases for OpenRouter models:
   # nemotron: nvidia/nemotron-3-super-120b-a12b:free
   # qwen3:    qwen/qwen3-coder:free

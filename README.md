@@ -101,7 +101,7 @@ default_model: sonnet
 models:
   haiku:  claude-haiku-4-5-20251001
   sonnet: claude-sonnet-4-6
-  opus:   claude-opus-4-6
+  opus:   claude-opus-4-7
 ` ``
 
 ### Task 1 -- short title
@@ -150,7 +150,7 @@ default_model: sonnet
 models:
   haiku:  claude-haiku-4-5-20251001
   sonnet: claude-sonnet-4-6
-  opus:   claude-opus-4-6
+  opus:   claude-opus-4-7
 ```
 
 `docs/autobuilderclaude_config_v1.yaml` is a template with placeholder values.
@@ -320,8 +320,9 @@ non-zero. Five reset-time formats are recognized:
   today is assumed; tomorrow is assumed only if the time passed more than 5 hours
   ago (same 5-hour-grace logic as the TZ-abbreviation format above).
 
-If a reset time is found, the script sleeps until (reset_time + 1 minute)
-and then retries the failing task automatically, up to 3 times:
+If a reset time is found, the script sleeps until reset_time (floored to at
+least now + 1 minute) and then retries the failing task automatically, up to
+3 times:
 
 ```
   Rate limit -- resets 2026-05-22T14:00:00+00:00; sleeping 3612s (wake 2026-05-22T15:00:12+00:00)
@@ -985,3 +986,28 @@ SPDX-License-Identifier: GPL-3.0-or-later
   autobuilderclaude_config_v1.yaml: fixed stale self-reference (autobuilder_ -> autobuilderclaude_)
   autobuilderclaude_plan_template_v1.md: fixed stale self-reference and companion file reference
   README.md: updated log files section; appended this entry
+
+[2026-08-22T11:00:44+00:00] patch v1.10.1 -> v1.10.2 -- expert audit fix pass (7 findings)
+  autobuilderclaude.py:
+    - H1: SpendLimitError check now requires proc.returncode != 0; previously raised on
+      exit-0 if combined output contained spend-limit text (e.g. informational message)
+    - H2: _RATE_LIMIT_RE quantifier reduced from {0,3} to {0,1}; too-broad pattern
+      could match non-rate-limit messages with 2-3 words before "limit"
+    - H3: _log_run_event() OSError handler now prints a stderr warning and captures the
+      exception as `e`; previously failed silently with no indication logging was lost
+    - H4: _chunked_sleep() call in rate-limit sleep block wrapped in try/except
+      KeyboardInterrupt; logs INTERRUPTED event before re-raising (previously no
+      run_events entry for KI during rate-limit sleep)
+    - H5: _task_worker() now calls _log_run_event before run_claude; parallel path
+      was missing the task-start event logged by the sequential path
+    - H6: removed extra timedelta(minutes=1) from wake_dt in run_claude; parse_reset_time()
+      already floors all branches to now+1min, so wake_dt was now+2min minimum
+    - H7: _RESET_RELATIVE_RE branch of parse_reset_time() now applies same floor clamp
+      as all other branches: max(result, now+timedelta(minutes=1))
+    - H8: _in_exec_window() DST fall-back assessed; Python's astimezone() handles DST
+      correctly for minute-of-day arithmetic; no code change needed
+    - Version bump to v1.10.2 (header comment and argparse description)
+  autobuilderclaude_config_v1.yaml: opus model ID updated claude-opus-4-6 -> claude-opus-4-7
+  autobuilderclaude_plan_template_v1.md: opus model ID updated claude-opus-4-6 -> claude-opus-4-7
+  README.md: opus model ID updated (2 code blocks); rate-limit sleep description updated
+    to reflect floor-clamp behavior; appended this entry

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.10.1
+# autobuilderclaude v1.10.2
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -119,7 +119,7 @@ _interrupt_event = threading.Event()
 # ---------------------------------------------------------------------------
 
 _RATE_LIMIT_RE = re.compile(
-    r'hit your (?:\w+\s+){0,3}limit|usage limit|rate.?limit|exceeded.*limit|limit.*exceeded',
+    r'hit your (?:\w+\s+){0,1}limit|usage limit|rate.?limit|exceeded.*limit|limit.*exceeded',
     re.IGNORECASE,
 )
 
@@ -261,7 +261,7 @@ def _log_run_event(log_dir, message):
                 _run_events_handle = open(log_dir / 'run_events.txt', 'a', encoding='utf-8')
             _run_events_handle.write(f'{ts}  {message}\n')
             _run_events_handle.flush()
-    except OSError:
+    except OSError as e:
         with _run_events_lock:
             if _run_events_handle is not None:
                 try:
@@ -269,6 +269,7 @@ def _log_run_event(log_dir, message):
                 except OSError:
                     pass
                 _run_events_handle = None
+        print(f'WARNING: run_events.txt write failed: {e}; event logging disabled', file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +433,8 @@ def parse_reset_time(message):
             delta = timedelta(minutes=amount)
         else:
             delta = timedelta(hours=amount)
-        return datetime.now(timezone.utc) + delta
+        result = datetime.now(timezone.utc) + delta
+        return max(result, datetime.now(timezone.utc) + timedelta(minutes=1))
 
     return None
 
@@ -1051,7 +1053,8 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
     and KeyboardInterrupt is re-raised for the caller to handle.
 
     Retry behavior: on a rate-limit response with a parseable reset time, sleeps
-    until (reset_time + 1 min) and retries, up to _MAX_RATE_LIMIT_RETRIES times.
+    until reset_time (floored to now+1min by parse_reset_time) and retries, up to
+    _MAX_RATE_LIMIT_RETRIES times.
     Sleep time is NOT counted in the reported elapsed time.
 
     Raises RateLimitError, SpendLimitError, FatalInvocationError, or
@@ -1185,7 +1188,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         combined = text_output + '\n' + raw + '\n' + err
 
         # Check for monthly spend limit before the long-no-output fatal check.
-        if _SPEND_LIMIT_RE.search(combined):
+        if proc.returncode != 0 and _SPEND_LIMIT_RE.search(combined):
             _log_run_event(log_dir, f'{label}: spend limit reached (attempt {attempt})')
             raise SpendLimitError(
                 (text_output.strip() or 'monthly spend limit reached')[:300]
@@ -1227,7 +1230,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         if is_limit:
             reset_dt = parse_reset_time(combined)
             if reset_dt is not None and attempt <= _MAX_RATE_LIMIT_RETRIES:
-                wake_dt    = reset_dt + timedelta(minutes=1)
+                wake_dt    = reset_dt
                 now_dt     = datetime.now(timezone.utc)
                 sleep_secs = max(0.0, (wake_dt - now_dt).total_seconds())
                 limit_msg = (
@@ -1238,7 +1241,14 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
                 )
                 _out(f'  {limit_msg}')
                 _log_run_event(log_dir, f'{label}: {limit_msg}')
-                actual_slept = _chunked_sleep(sleep_secs, wake_dt, 'Rate limit sleep', _out)
+                try:
+                    actual_slept = _chunked_sleep(sleep_secs, wake_dt, 'Rate limit sleep', _out)
+                except KeyboardInterrupt:
+                    _log_run_event(
+                        log_dir,
+                        f'{label}: INTERRUPTED during rate-limit sleep (attempt {attempt})',
+                    )
+                    raise
                 resume_msg = (
                     f'Rate limit sleep complete: slept {actual_slept:.0f}s; '
                     f'retrying (attempt {attempt + 1})'
@@ -1281,6 +1291,7 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
         lines.append(f'  files: {", ".join(task["files"])}')
     lines.append('=' * 70)
 
+    _log_run_event(log_dir, f'Task {task["num"]} ({task["title"]}): starting')
     try:
         rc, usage = run_claude(
             prompt, model, dry_run, log_dir, label, add_dirs, allowed_tools,
@@ -1309,7 +1320,7 @@ def build_arg_parser():
     """Construct and return the ArgumentParser for autobuilderclaude."""
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.10.1 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.10.2 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
