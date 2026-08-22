@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.10.0
+# autobuilderclaude v1.10.1
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -163,7 +163,7 @@ _TZ_OFFSETS = {
     'UTC': 0,   'GMT': 0,   'UT': 0,
     # North America -- Standard / Daylight (ambiguous: CST also China +8; use IANA Asia/Shanghai)
     'NST': -3.5,  'NDT': -2.5,   # Newfoundland
-    'AST': -4,    'ADT': -3,     # Atlantic
+    'AST': -4,    'ADT': -3,     # Atlantic (ambiguous: Arabia Standard Time = +3; use IANA America/Halifax)
     'EST': -5,    'EDT': -4,     # Eastern
     'CST': -6,    'CDT': -5,     # Central
     'MST': -7,    'MDT': -6,     # Mountain
@@ -262,7 +262,13 @@ def _log_run_event(log_dir, message):
             _run_events_handle.write(f'{ts}  {message}\n')
             _run_events_handle.flush()
     except OSError:
-        pass
+        with _run_events_lock:
+            if _run_events_handle is not None:
+                try:
+                    _run_events_handle.close()
+                except OSError:
+                    pass
+                _run_events_handle = None
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +397,8 @@ def parse_reset_time(message):
                     dt = datetime(int(year_str), month, int(day_str), h, mn, sc)
                     offset_h = _TZ_OFFSETS.get(tz_abbr, 0)
                     tz = timezone(timedelta(hours=offset_h))
-                    return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+                    now_utc = datetime.now(timezone.utc)
+                    return max(dt.replace(tzinfo=tz).astimezone(timezone.utc), now_utc + timedelta(minutes=1))
                 except (ValueError, KeyError):
                     pass
         else:
@@ -1256,7 +1263,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
     return proc.returncode, usage
 
 
-def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed_tools=None, extra_claude_args=None, exec_windows=None, task_body=None):
+def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed_tools=None, extra_claude_args=None, exec_windows=None, task_body=None, print_lock=None):
     """
     Worker function for parallel task execution via ThreadPoolExecutor.
     Buffers all output into a list and returns it atomically.
@@ -1283,7 +1290,11 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
     except KeyboardInterrupt:
         marker = write_completion_marker(log_dir, task['num'], task['title'], RC_INTERRUPTED)
         lines.append(f'  marker  -> {marker}')
-        print('\n'.join(lines))
+        if print_lock is not None:
+            with print_lock:
+                print('\n'.join(lines))
+        else:
+            print('\n'.join(lines))
         raise
     marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
     lines.append(f'  marker  -> {marker}')
@@ -1298,7 +1309,7 @@ def build_arg_parser():
     """Construct and return the ArgumentParser for autobuilderclaude."""
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.10.0 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.10.1 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
@@ -1384,12 +1395,13 @@ def main():
     """
     global _run_events_handle
     _interrupt_event.clear()
-    if _run_events_handle is not None:
-        try:
-            _run_events_handle.close()
-        except OSError:
-            pass
-        _run_events_handle = None
+    with _run_events_lock:
+        if _run_events_handle is not None:
+            try:
+                _run_events_handle.close()
+            except OSError:
+                pass
+            _run_events_handle = None
 
     parser = build_arg_parser()
     args, extra_args = parser.parse_known_args()
@@ -1588,7 +1600,7 @@ def main():
                         _task_worker,
                         task, model, prompt, args.dry_run, log_dir, label,
                         add_dirs, allowed_tools_list, task_claude_args,
-                        exec_windows, task['prompt_body'],
+                        exec_windows, task['prompt_body'], print_lock,
                     ): task['num']
                     for task, model, prompt, label, task_claude_args, exec_windows in work_items
                 }
@@ -1608,9 +1620,10 @@ def main():
                         else:
                             event = 'Run aborted: rate limit exhausted'
                         _abort_run(e, log_dir, event, print_lock=print_lock)
-                    with print_lock:
-                        print('\n'.join(lines))
-                    _accumulate(rc, usage, task_num)
+                    else:
+                        with print_lock:
+                            print('\n'.join(lines))
+                        _accumulate(rc, usage, task_num)
             except KeyboardInterrupt:
                 _log_run_event(log_dir, 'Run INTERRUPTED by user (Ctrl-C) during parallel execution')
                 print('Canceling remaining tasks...', file=sys.stderr)
