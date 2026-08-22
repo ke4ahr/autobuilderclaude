@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.9.0
+# autobuilderclaude v1.10.0
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -159,11 +159,46 @@ _SLEEP_REPORT_INTERVAL = 7200
 _MAX_RATE_LIMIT_RETRIES = 3
 
 _TZ_OFFSETS = {
-    'UTC': 0, 'GMT': 0,
-    'EST': -5, 'EDT': -4,
-    'CST': -6, 'CDT': -5,
-    'MST': -7, 'MDT': -6,
-    'PST': -8, 'PDT': -7,
+    # UTC / GMT
+    'UTC': 0,   'GMT': 0,   'UT': 0,
+    # North America -- Standard / Daylight (ambiguous: CST also China +8; use IANA Asia/Shanghai)
+    'NST': -3.5,  'NDT': -2.5,   # Newfoundland
+    'AST': -4,    'ADT': -3,     # Atlantic
+    'EST': -5,    'EDT': -4,     # Eastern
+    'CST': -6,    'CDT': -5,     # Central
+    'MST': -7,    'MDT': -6,     # Mountain
+    'PST': -8,    'PDT': -7,     # Pacific
+    'AKST': -9,   'AKDT': -8,    # Alaska
+    'HST': -10,   'HDT': -9,     # Hawaii
+    'HAST': -10,  'HADT': -9,    # Hawaii-Aleutian
+    'SST': -11,                   # Samoa
+    # Europe
+    'WET': 0,                     # Western European
+    'WEST': 1,   'BST': 1,       # W. European Summer / British Summer
+    'CET': 1,    'CEST': 2,      # Central European / Summer
+    'EET': 2,    'EEST': 3,      # Eastern European / Summer
+    # Middle East / Russia / Africa
+    'MSK': 3,                     # Moscow
+    'TRT': 3,                     # Turkey
+    'GST': 4,                     # Gulf Standard (UAE, Oman)
+    'AFT': 4.5,                   # Afghanistan
+    'PKT': 5,                     # Pakistan
+    'NPT': 5.75,                  # Nepal
+    'MMT': 6.5,                   # Myanmar
+    # Asia / Pacific (ambiguous: IST = Ireland +1 OR India +5.5 OR Israel +2; use IANA)
+    'ICT': 7,                     # Indochina
+    'WIB': 7,                     # Western Indonesia
+    'HKT': 8,                     # Hong Kong
+    'SGT': 8,                     # Singapore
+    'MYT': 8,                     # Malaysia
+    'PHT': 8,                     # Philippines
+    'AWST': 8,                    # Australia Western
+    'JST': 9,                     # Japan
+    'KST': 9,                     # Korea
+    'WIT': 9,                     # Eastern Indonesia
+    'ACST': 9.5,  'ACDT': 10.5,  # Australia Central Std / Daylight
+    'AEST': 10,   'AEDT': 11,    # Australia Eastern Std / Daylight
+    'NZST': 12,   'NZDT': 13,    # New Zealand Std / Daylight
 }
 _MONTH_NAMES = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4,
@@ -205,6 +240,10 @@ DEFAULT_ALLOWED_TOOLS = ['Bash', 'Edit', 'Read', 'Write']
 _license_header_cache: dict = {}
 _license_header_cache_lock = threading.Lock()
 
+# Cached open file handle for run_events.txt; one handle per run, reset in main().
+_run_events_handle = None
+_run_events_lock   = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Run event logging
@@ -212,12 +251,16 @@ _license_header_cache_lock = threading.Lock()
 
 def _log_run_event(log_dir, message):
     """Append a timestamped event line to run_events.txt in the log directory."""
+    global _run_events_handle
     if log_dir is None:
         return
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
     try:
-        with open(log_dir / 'run_events.txt', 'a', encoding='utf-8') as fh:
-            fh.write(f'{ts}  {message}\n')
+        with _run_events_lock:
+            if _run_events_handle is None:
+                _run_events_handle = open(log_dir / 'run_events.txt', 'a', encoding='utf-8')
+            _run_events_handle.write(f'{ts}  {message}\n')
+            _run_events_handle.flush()
     except OSError:
         pass
 
@@ -225,6 +268,13 @@ def _log_run_event(log_dir, message):
 # ---------------------------------------------------------------------------
 # Rate-limit time parsing
 # ---------------------------------------------------------------------------
+
+def _roll_time_if_past(reset_local, now_local):
+    """Roll reset_local forward one day if it passed more than 1 hour ago."""
+    if reset_local < now_local - timedelta(hours=1):
+        return reset_local + timedelta(days=1)
+    return reset_local
+
 
 def parse_reset_time(message):
     """
@@ -245,15 +295,19 @@ def parse_reset_time(message):
         base = s[:19].replace('T', ' ')
         try:
             dt = datetime.strptime(base, '%Y-%m-%d %H:%M:%S')
+            now_utc = datetime.now(timezone.utc)
             if s.endswith('Z'):
-                return dt.replace(tzinfo=timezone.utc)
-            off_m = re.search(r'([+-])(\d{2}):?(\d{2})$', s)
-            if off_m:
-                sign = 1 if off_m.group(1) == '+' else -1
-                h, mn = int(off_m.group(2)), int(off_m.group(3))
-                tz = timezone(timedelta(hours=sign * h, minutes=sign * mn))
-                return dt.replace(tzinfo=tz).astimezone(timezone.utc)
-            return dt.replace(tzinfo=timezone.utc)
+                reset_utc = dt.replace(tzinfo=timezone.utc)
+            else:
+                off_m = re.search(r'([+-])(\d{2}):?(\d{2})$', s)
+                if off_m:
+                    sign = 1 if off_m.group(1) == '+' else -1
+                    h, mn = int(off_m.group(2)), int(off_m.group(3))
+                    tz = timezone(timedelta(hours=sign * h, minutes=sign * mn))
+                    reset_utc = dt.replace(tzinfo=tz).astimezone(timezone.utc)
+                else:
+                    reset_utc = dt.replace(tzinfo=timezone.utc)
+            return max(reset_utc, now_utc + timedelta(minutes=1))
         except ValueError:
             pass
 
@@ -285,7 +339,7 @@ def parse_reset_time(message):
                     reset_dt = datetime(year, month, int(day_str), h, mn, 0, tzinfo=tz)
                     if reset_dt.astimezone(timezone.utc) <= now_utc:
                         reset_dt = datetime(year + 1, month, int(day_str), h, mn, 0, tzinfo=tz)
-                    return reset_dt.astimezone(timezone.utc)
+                    return max(reset_dt.astimezone(timezone.utc), now_utc + timedelta(minutes=1))
                 except (_ZINotFoundError, ValueError):
                     pass
 
@@ -307,8 +361,7 @@ def parse_reset_time(message):
                     h = 0
                 now_local   = datetime.now(tz)
                 reset_local = now_local.replace(hour=h, minute=mn, second=0, microsecond=0)
-                if reset_local < now_local - timedelta(hours=5):
-                    reset_local += timedelta(days=1)
+                reset_local = _roll_time_if_past(reset_local, now_local)
                 now_utc = now_local.astimezone(timezone.utc)
                 return max(reset_local.astimezone(timezone.utc), now_utc + timedelta(minutes=1))
             except _ZINotFoundError:
@@ -355,8 +408,7 @@ def parse_reset_time(message):
                 tz = timezone(timedelta(hours=offset_h))
                 now_local = datetime.now(tz)
                 reset_local = now_local.replace(hour=h, minute=mn, second=sc, microsecond=0)
-                if reset_local < now_local - timedelta(hours=5):
-                    reset_local += timedelta(days=1)
+                reset_local = _roll_time_if_past(reset_local, now_local)
                 now_utc = now_local.astimezone(timezone.utc)
                 return max(reset_local.astimezone(timezone.utc), now_utc + timedelta(minutes=1))
             except (ValueError, KeyError):
@@ -1038,7 +1090,15 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
             raise KeyboardInterrupt('Interrupted by user')
 
         attempt += 1
-        wait_for_exec_window(exec_windows, _out, log_dir)
+        try:
+            wait_for_exec_window(exec_windows, _out, log_dir)
+        except KeyboardInterrupt:
+            _interrupt_event.set()
+            _log_run_event(
+                log_dir,
+                f'{label}: INTERRUPTED during exec-window wait (attempt {attempt})',
+            )
+            raise
         run_ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
         t0 = time.monotonic()
 
@@ -1223,6 +1283,7 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
     except KeyboardInterrupt:
         marker = write_completion_marker(log_dir, task['num'], task['title'], RC_INTERRUPTED)
         lines.append(f'  marker  -> {marker}')
+        print('\n'.join(lines))
         raise
     marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
     lines.append(f'  marker  -> {marker}')
@@ -1237,7 +1298,7 @@ def build_arg_parser():
     """Construct and return the ArgumentParser for autobuilderclaude."""
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.9.0 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.10.0 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
@@ -1273,6 +1334,34 @@ def build_arg_parser():
 
 
 # ---------------------------------------------------------------------------
+# Error handling helpers
+# ---------------------------------------------------------------------------
+
+def _abort_run(exc, log_dir, event_msg, *, print_lock=None, skip_remaining=True):
+    """
+    Print the appropriate error message for exc, log the event, and exit 1.
+    Handles FatalInvocationError, SpendLimitError, and RateLimitError.
+    """
+    if isinstance(exc, FatalInvocationError):
+        msgs = [f'\nFATAL: {exc}']
+    elif isinstance(exc, SpendLimitError):
+        msgs = [f'\nERROR: monthly spend limit -- {exc}', 'Raise it at claude.ai/settings/usage']
+    else:
+        msgs = [f'\nERROR: rate limit reached -- {exc}']
+    if skip_remaining:
+        msgs.append('Remaining tasks skipped.')
+    if print_lock is not None:
+        with print_lock:
+            for msg in msgs:
+                print(msg, file=sys.stderr)
+    else:
+        for msg in msgs:
+            print(msg, file=sys.stderr)
+    _log_run_event(log_dir, event_msg)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1293,6 +1382,15 @@ def main():
 
     Exits with RC_INTERRUPTED (130) on Ctrl-C.
     """
+    global _run_events_handle
+    _interrupt_event.clear()
+    if _run_events_handle is not None:
+        try:
+            _run_events_handle.close()
+        except OSError:
+            pass
+        _run_events_handle = None
+
     parser = build_arg_parser()
     args, extra_args = parser.parse_known_args()
 
@@ -1502,25 +1600,14 @@ def main():
                         with print_lock:
                             print('\nInterrupted (Ctrl-C).', file=sys.stderr)
                         raise
-                    except FatalInvocationError as e:
-                        with print_lock:
-                            print(f'\nFATAL: {e}', file=sys.stderr)
-                            print('Remaining tasks skipped.', file=sys.stderr)
-                        _log_run_event(log_dir, f'Run aborted: fatal invocation error')
-                        sys.exit(1)
-                    except SpendLimitError as e:
-                        with print_lock:
-                            print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
-                            print('Raise it at claude.ai/settings/usage', file=sys.stderr)
-                            print('Remaining tasks skipped.', file=sys.stderr)
-                        _log_run_event(log_dir, f'Run aborted: spend limit reached')
-                        sys.exit(1)
-                    except RateLimitError as e:
-                        with print_lock:
-                            print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
-                            print('Remaining tasks skipped.', file=sys.stderr)
-                        _log_run_event(log_dir, f'Run aborted: rate limit exhausted')
-                        sys.exit(1)
+                    except (FatalInvocationError, SpendLimitError, RateLimitError) as e:
+                        if isinstance(e, FatalInvocationError):
+                            event = 'Run aborted: fatal invocation error'
+                        elif isinstance(e, SpendLimitError):
+                            event = 'Run aborted: spend limit reached'
+                        else:
+                            event = 'Run aborted: rate limit exhausted'
+                        _abort_run(e, log_dir, event, print_lock=print_lock)
                     with print_lock:
                         print('\n'.join(lines))
                     _accumulate(rc, usage, task_num)
@@ -1567,28 +1654,21 @@ def main():
                     _log_run_event(log_dir, f'Task {task["num"]}: INTERRUPTED by user')
                     write_completion_marker(log_dir, task['num'], task['title'], RC_INTERRUPTED)
                     raise
-                except FatalInvocationError as e:
-                    print(f'\nFATAL: {e}', file=sys.stderr)
-                    print('Remaining tasks skipped.', file=sys.stderr)
-                    _log_run_event(log_dir, f'Task {task["num"]}: fatal invocation error -- run aborted')
-                    sys.exit(1)
-                except SpendLimitError as e:
-                    print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
-                    print('Raise it at claude.ai/settings/usage', file=sys.stderr)
-                    print('Remaining tasks skipped.', file=sys.stderr)
-                    _log_run_event(log_dir, f'Task {task["num"]}: spend limit -- run aborted')
-                    sys.exit(1)
-                except RateLimitError as e:
-                    print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
-                    print('Remaining tasks skipped.', file=sys.stderr)
-                    _log_run_event(log_dir, f'Task {task["num"]}: rate limit exhausted -- run aborted')
-                    sys.exit(1)
+                except (FatalInvocationError, SpendLimitError, RateLimitError) as e:
+                    n = task['num']
+                    if isinstance(e, FatalInvocationError):
+                        event = f'Task {n}: fatal invocation error -- run aborted'
+                    elif isinstance(e, SpendLimitError):
+                        event = f'Task {n}: spend limit -- run aborted'
+                    else:
+                        event = f'Task {n}: rate limit exhausted -- run aborted'
+                    _abort_run(e, log_dir, event)
                 marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
                 print(f'  marker  -> {marker}')
                 _accumulate(rc, usage, task['num'])
 
         if run_verify and verification:
-            model_key    = args.model or verification['model']
+            model_key    = args.model or verification['model'] or default_model
             model        = resolve_model(model_key, config)
             effort       = resolve_task_effort(verification, args.effort, config)
             verify_claude_args = (['--effort', effort] if effort else []) + pass_through_args
@@ -1614,19 +1694,14 @@ def main():
             except KeyboardInterrupt:
                 _log_run_event(log_dir, 'Verification: INTERRUPTED by user')
                 raise
-            except FatalInvocationError as e:
-                print(f'\nFATAL: {e}', file=sys.stderr)
-                _log_run_event(log_dir, 'Verification: fatal invocation error -- run aborted')
-                sys.exit(1)
-            except SpendLimitError as e:
-                print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
-                print('Raise it at claude.ai/settings/usage', file=sys.stderr)
-                _log_run_event(log_dir, 'Verification: spend limit -- run aborted')
-                sys.exit(1)
-            except RateLimitError as e:
-                print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
-                _log_run_event(log_dir, 'Verification: rate limit exhausted -- run aborted')
-                sys.exit(1)
+            except (FatalInvocationError, SpendLimitError, RateLimitError) as e:
+                if isinstance(e, FatalInvocationError):
+                    event = 'Verification: fatal invocation error -- run aborted'
+                elif isinstance(e, SpendLimitError):
+                    event = 'Verification: spend limit -- run aborted'
+                else:
+                    event = 'Verification: rate limit exhausted -- run aborted'
+                _abort_run(e, log_dir, event, skip_remaining=False)
             _accumulate(rc, usage)
 
         _log_run_event(log_dir, f'Run completed: exit_code={exit_code}')
