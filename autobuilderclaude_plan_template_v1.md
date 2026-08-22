@@ -17,16 +17,16 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 -->
 <!--
-  autobuilder_plan_template_v1.md
-  Template and format specification for auto-builder implementation plans.
-  Parser: auto-builder.py (format v1)
+  autobuilderclaude_plan_template_v1.md
+  Template and format specification for autobuilderclaude implementation plans.
+  Parser: autobuilderclaude.py (format v1)
 
   COMPANION FILES:
-    autobuilder_config_v1.yaml  -- runtime config (repo path, model aliases, log
-                                   dir, license file). Passed to auto-builder.py
-                                   via --config. When present, its values override
-                                   any Build Config block in this plan.
-                                   See autobuilder_config_v1.yaml for the template.
+    autobuilderclaude_config_v1.yaml  -- runtime config (repo path, model aliases, log
+                                         dir, license file). Passed to autobuilderclaude.py
+                                         via --config. When present, its values override
+                                         any Build Config block in this plan.
+                                         See autobuilderclaude_config_v1.yaml for the template.
 
   INSTRUCTIONS FOR THE CLAUDE INSTANCE WRITING A PLAN:
   - Copy this file. Replace every {PLACEHOLDER} with real values.

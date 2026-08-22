@@ -387,11 +387,14 @@ Each run creates a timestamped subdirectory under `log_dir`:
 
 ```
 {log_dir}/{plan_stem}_{YYYY-MM-DDThh:mm:ss+00:00}/
+  common_context.txt                              (repo path, preamble, license; shared by all tasks)
+  run_events.txt                                  (timestamped run start/stop, rate-limit, abort events)
   task_001_{title}_{hh:mm:ss+00:00}_prompt.txt
   task_001_{title}_{hh:mm:ss+00:00}_output.txt
-  task_001_{title}_{hh:mm:ss+00:00}_stderr.txt  (only if claude wrote to stderr)
-  task_1_YYYY-MM-DD_completed.txt   (exit 0)
-  task_1_YYYY-MM-DD_failed.txt      (exit non-zero)
+  task_001_{title}_{hh:mm:ss+00:00}_stderr.txt   (only if claude wrote to stderr)
+  task_1_YYYY-MM-DD_completed.txt                 (exit 0)
+  task_1_YYYY-MM-DD_interrupted.txt               (exit 130, Ctrl-C)
+  task_1_YYYY-MM-DD_failed.txt                    (any other non-zero exit)
   task_002_...
   verify_{hh:mm:ss+00:00}_prompt.txt
   verify_{hh:mm:ss+00:00}_output.txt
@@ -399,11 +402,17 @@ Each run creates a timestamped subdirectory under `log_dir`:
 
 Output files contain the text response only (JSON envelope stripped).
 Stderr files capture any output written to stderr by the claude subprocess.
+`common_context.txt` holds the repo path, preamble, and license header shared
+by all task prompts; it is written once at the start of the run.
+`run_events.txt` records run start/stop, rate-limit retries, abortions, and
+Ctrl-C interruptions with UTC timestamps; it is appended across retries.
 
-Each completed task drops a marker file named
-`task_N_YYYY-MM-DD_completed.txt` (exit 0) or `task_N_YYYY-MM-DD_failed.txt`
-(non-zero exit). The marker contains the task number, title, date, and exit
-code. Tasks aborted by a rate-limit error do not produce a marker.
+Each completed task drops a marker file:
+`task_N_YYYY-MM-DD_completed.txt` (exit 0),
+`task_N_YYYY-MM-DD_interrupted.txt` (exit 130, Ctrl-C), or
+`task_N_YYYY-MM-DD_failed.txt` (any other non-zero exit).
+The marker contains the task number, title, timestamp, and exit code.
+Tasks aborted by a rate-limit error do not produce a marker.
 
 ## Examples
 
@@ -900,3 +909,79 @@ SPDX-License-Identifier: GPL-3.0-or-later
     - Updated Rate-limit handling: limit-keyword phrase now covers up to 3 qualifier words;
       1-hour rollover grace updated to 5 hours (two mentions)
     - Token usage section: example updated to show Return code line (removed output tokens line)
+
+[2026-08-22T03:41:19+00:00] feature v1.7.0 -> v1.8.0 -- Ctrl-C handling, run_events.txt, common context
+  (developed in s394; committed as part of v1.9.0 / e579cb0)
+  autobuilderclaude.py:
+    - Added RC_INTERRUPTED = 130 constant; main() catches KeyboardInterrupt and exits 130
+    - Added _interrupt_event: module-level threading.Event; set on KI in parallel mode
+    - Added _log_run_event(log_dir, message): appends timestamped event lines to run_events.txt;
+      handle cached in _run_events_handle / _run_events_lock to avoid per-call open/close
+    - Added build_common_context(config): builds repo/preamble/license prefix once per run;
+      written to common_context.txt; referenced by all task prompts
+    - _chunked_sleep(): now returns actual seconds slept (float)
+    - wait_for_exec_window(): logs wait-start and wake events to run_events.txt; returns total
+      wait seconds
+    - run_claude(): tracks total_run_secs excluding sleep time; wraps proc.communicate() in
+      KeyboardInterrupt handler; logs task-start and task-end events; accepts task_body param
+      (prompt log contains body only, not the full prefixed prompt)
+    - _task_worker(): passes task_body through to run_claude
+    - write_completion_marker(): adds _interrupted.txt status (exit 130) alongside _completed.txt
+      and _failed.txt
+    - main(): builds common context once, writes common_context.txt; passes task_body to
+      run_claude; handles KeyboardInterrupt with RC_INTERRUPTED exit; logs run start/end events
+  README.md:
+    - Log files section: added run_events.txt, common_context.txt, _interrupted.txt entries
+    - Activity log section: appended this entry
+
+[2026-08-22T03:41:19+00:00] patch v1.8.0 -> v1.9.0 -- 9-finding expert audit fix pass (commit e579cb0)
+  autobuilderclaude.py:
+    - 9 audit findings applied (full detail in autobuilderclaude_activity.log s395)
+    - py_compile OK
+
+[2026-08-22T05:41:29+00:00] feature v1.9.0 -> v1.10.0 -- TZ expansion, floor clamps, KI hardening, helpers
+  autobuilderclaude.py:
+    - _TZ_OFFSETS expanded from 10 to 40 entries: full international coverage including
+      European (CET/CEST/EET/EEST), Australian (AEST/AEDT/ACST/ACDT/AWST), Asian (IST/JST/
+      KST/CST/HKT/SGT/ICT), Middle East (EAT/MSK/TRT/AST/IRST), and fractional-offset zones
+      (IST +5:30, NPT +5:45, AFT +4:30, IRST +3:30)
+    - F1: ISO 8601 branch of parse_reset_time() now applies floor clamp:
+      max(reset_utc, now_utc + timedelta(minutes=1)) before return
+    - F2: full-date IANA branch applies same floor clamp
+    - F3+F8: extracted _roll_time_if_past(reset_local, now_local) helper; 5h threshold
+      reverted to 1h; both IANA and 12H time-only branches now share the helper
+    - F4: _task_worker() prints buffered lines before re-raising KeyboardInterrupt
+    - F5: wait_for_exec_window() call in run_claude() wrapped in try/except
+      KeyboardInterrupt so _interrupted.txt and run_events.txt are written on Ctrl-C
+    - F6: _interrupt_event.clear() added at start of main(); _run_events_handle reset
+    - F7: verification model resolution adds 'or default_model' fallback
+    - F9: _log_run_event() opens run_events.txt once per run and caches the handle
+      (_run_events_handle); previously opened and closed the file on every event call
+    - F10: _abort_run(exc, log_dir, event_msg, *, print_lock, skip_remaining) helper
+      consolidates triplicated FatalInvocationError/SpendLimitError/RateLimitError handlers
+    - Version bump to v1.10.0 (header comment and argparse description)
+  autobuilderclaude_config_v1.yaml: no changes
+  autobuilderclaude_plan_template_v1.md: no changes
+  README.md: appended this entry
+
+[2026-08-22T08:49:40+00:00] patch v1.10.0 -> v1.10.1 -- code-review fix pass (6 findings)
+  autobuilderclaude.py:
+    - G1: bare-12H full-date branch in parse_reset_time() was missing the floor clamp
+      added by F1/F2; now applies max(reset_utc, now_utc + timedelta(minutes=1))
+    - G2: _log_run_event() except OSError now resets _run_events_handle to None under
+      _run_events_lock; previously the broken handle survived as non-None, silently
+      dropping all subsequent events
+    - G3: _task_worker() accepts print_lock=None parameter; KeyboardInterrupt handler
+      acquires print_lock (if provided) before printing buffered lines; parallel
+      executor passes print_lock through to prevent interleaved KI output
+    - G4: parallel loop restructured from try/except to try/except/else so lines and
+      _accumulate() are only reached in the else (success) path; prevents latent
+      NameError if _abort_run() is ever changed not to call sys.exit()
+    - G5: AST entry in _TZ_OFFSETS has inline comment noting Arabia Standard Time
+      (+3) ambiguity; recommends IANA America/Halifax for unambiguous parsing
+    - G6: _run_events_handle close+null in main() wrapped in _run_events_lock to
+      prevent a race with lingering workers after executor.shutdown(wait=False)
+    - Version bump to v1.10.1 (header comment and argparse description)
+  autobuilderclaude_config_v1.yaml: fixed stale self-reference (autobuilder_ -> autobuilderclaude_)
+  autobuilderclaude_plan_template_v1.md: fixed stale self-reference and companion file reference
+  README.md: updated log files section; appended this entry

@@ -15,8 +15,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
-# autobuilder_config_v1.yaml
-# Runtime configuration for auto-builder.py (format v1).
+# autobuilderclaude_config_v1.yaml
+# Runtime configuration for autobuilderclaude.py (format v1).
 #
 # Usage:
 #   autobuilderclaude.py --input plan.md --config this_file.yaml
