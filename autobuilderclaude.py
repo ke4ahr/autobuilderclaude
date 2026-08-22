@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# autobuilderclaude v1.6.9
+# autobuilderclaude v1.9.0
 # Copyright (C) 2026 Kris Kirby
 # https://github.com/ke4ahr/autobuilderclaude
 #
@@ -23,9 +23,9 @@
 # Parses an implementation plan (autobuilderclaude format v1) and executes tasks
 # via the claude CLI. Per-task model is read from the plan document.
 # All I/O to and from claude is captured to timestamped log files.
-# Output token count is printed as a dedicated line per task.
+# Output token counts are included in the per-task output line.
 # On a 429/rate-limit response that contains a
-# reset time, the script sleeps until (reset_time + 10 minutes) and retries
+# reset time, the script sleeps until (reset_time + 1 minute) and retries
 # the failing task automatically. Sleeps longer than 24 hours are supported;
 # a progress line is printed every 2 hours during the wait.
 #
@@ -37,6 +37,19 @@
 # Outside the window, the script sleeps until the window opens before each attempt,
 # including attempts after a rate-limit retry wake-up. Per-task ExecWindow:
 # overrides the config default; omit both for unrestricted execution.
+#
+# Ctrl-C (SIGINT) is caught cleanly at all blocking points (communicate, sleep).
+# The current subprocess is terminated, partial output is written to a log file,
+# and the run exits with code 130 (POSIX convention: 128 + signal 2). All waits,
+# retries, abortions, and terminations are logged to run_events.txt in the log dir.
+#
+# The common context (working directory, preamble, license header) is the same for
+# every task in a run. It is written once to common_context.txt and referenced by
+# each task's prompt log, which contains only the task-specific body. In dry-run
+# mode the common context is printed once, not once per task.
+#
+# Task elapsed time reports and totals count only subprocess execution time and
+# exclude all sleep and wait time (rate-limit, exec-window, retry waits).
 #
 # Usage:
 #   autobuilderclaude --input PLAN [--template TEMPLATE] [--config CONFIG] [OPTIONS]
@@ -95,6 +108,12 @@ DEFAULT_MODEL_IDS = {
     'opus':   'claude-opus-4-7',
 }
 
+# Exit code for Ctrl-C / SIGINT interruption (POSIX: 128 + signal 2).
+RC_INTERRUPTED = 130
+
+# Set when Ctrl-C is received; workers check this between retry attempts.
+_interrupt_event = threading.Event()
+
 # ---------------------------------------------------------------------------
 # Rate-limit detection and retry
 # ---------------------------------------------------------------------------
@@ -136,8 +155,7 @@ _RESET_DATE_IANA_RE = re.compile(
 # Progress interval for long rate-limit sleeps (seconds).
 _SLEEP_REPORT_INTERVAL = 7200
 
-# Maximum number of rate-limit retries before giving up and raising
-# RateLimitError.
+# Maximum number of rate-limit retries before giving up.
 _MAX_RATE_LIMIT_RETRIES = 3
 
 _TZ_OFFSETS = {
@@ -157,46 +175,70 @@ _MONTH_NAMES = {
 
 
 class RateLimitError(RuntimeError):
-    """Raised when the claude CLI output indicates a usage-rate limit."""
+    """
+    Raised when the claude CLI output indicates a usage-rate limit has been hit.
+    """
     pass
 
 
 class SpendLimitError(RateLimitError):
-    """Raised when the monthly account spend limit is reached (not retryable)."""
+    """
+    Raised when the monthly account spend limit is reached.
+    Unlike RateLimitError, this is not retryable.
+    """
     pass
 
 
 class FatalInvocationError(RuntimeError):
-    """Raised when a claude invocation ran >29 min, exited with error, and produced no output."""
+    """
+    Raised when a claude invocation ran longer than _FATAL_TIMEOUT_SECS,
+    exited non-zero, and produced no output on two consecutive occurrences.
+    """
     pass
 
 
-# Invocations that run longer than this threshold AND exit non-zero AND produce
-# no output are considered suspect. A second such occurrence within the same
-# task's retry loop is fatal. One occurrence is tolerated (may be retried if
-# it is also a rate-limit hit).
 _FATAL_TIMEOUT_SECS = 29 * 60
 
-
-# Tools granted to claude when neither config nor --allowedTools sets a list.
-# Single source of truth for run_claude()'s default and main()'s fallback.
 DEFAULT_ALLOWED_TOOLS = ['Bash', 'Edit', 'Read', 'Write']
 
-# Cache for license file content; populated on first build_prompt() call per path.
+# Cache for license file content; populated on first build_common_context() call.
 _license_header_cache: dict = {}
+_license_header_cache_lock = threading.Lock()
 
+
+# ---------------------------------------------------------------------------
+# Run event logging
+# ---------------------------------------------------------------------------
+
+def _log_run_event(log_dir, message):
+    """Append a timestamped event line to run_events.txt in the log directory."""
+    if log_dir is None:
+        return
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
+    try:
+        with open(log_dir / 'run_events.txt', 'a', encoding='utf-8') as fh:
+            fh.write(f'{ts}  {message}\n')
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit time parsing
+# ---------------------------------------------------------------------------
 
 def parse_reset_time(message):
     """
-    Extract the rate-limit reset datetime from a message string.
-    Returns a UTC-aware datetime, or None if no parseable time is found.
-    Handles ISO 8601, 12-hour clock with TZ abbreviation, and relative offsets.
+    Extract the rate-limit reset datetime from a Claude CLI error message.
+    Returns a UTC-aware datetime object, or None if no parseable time is found.
 
-    IANA-zone patterns are checked before the bare 12H pattern so that a
-    message like "resets 4:40am (America/Chicago)" is parsed with the correct
-    timezone rather than being misread as 4:40 AM UTC and rolled to next day.
+    Supported formats (in precedence order):
+    1. ISO 8601: "2026-05-22T14:00:00Z" or "2026-05-22T14:00:00-05:00"
+    2. Month + day + 12H + IANA zone: "May 26, 12pm (America/Chicago)"
+    3. Time-only + IANA zone: "7:20am (America/Chicago)"
+    4. 12H with TZ abbreviation and optional date: "9:00 PM CDT on Thursday, May 22, 2026"
+    5. Relative offset: "retry after 60 seconds" / "reset in 5 minutes"
     """
-    # ISO 8601: 2026-05-22T14:00:00Z or 2026-05-22T14:00:00-05:00
+    # ISO 8601
     m = _RESET_ISO_RE.search(message)
     if m:
         s = m.group(1)
@@ -218,7 +260,7 @@ def parse_reset_time(message):
     # IANA-zone patterns checked before bare 12H to avoid misreading
     # "4:40am (America/Chicago)" as 4:40 AM UTC.
 
-    # "May 26, 12pm (America/Chicago)" -- month+day + time + IANA zone name
+    # "May 26, 12pm (America/Chicago)"
     if _HAVE_ZONEINFO:
         m = _RESET_DATE_IANA_RE.search(message)
         if m:
@@ -247,7 +289,7 @@ def parse_reset_time(message):
                 except (_ZINotFoundError, ValueError):
                     pass
 
-    # "7:20am (America/Chicago)" or "12pm (America/Chicago)" -- time-only with IANA zone
+    # "7:20am (America/Chicago)"
     if _HAVE_ZONEINFO:
         m = _RESET_TIME_IANA_RE.search(message)
         if m:
@@ -265,17 +307,14 @@ def parse_reset_time(message):
                     h = 0
                 now_local   = datetime.now(tz)
                 reset_local = now_local.replace(hour=h, minute=mn, second=0, microsecond=0)
-                # Only roll to the next day if the reset time passed more than
-                # 1 hour ago. A reset time that just barely passed (<= 1h) is
-                # the same boundary the script already waited for; adding a day
-                # would schedule 24h instead of a short retry.
-                if reset_local < now_local - timedelta(hours=1):
+                if reset_local < now_local - timedelta(hours=5):
                     reset_local += timedelta(days=1)
-                return reset_local.astimezone(timezone.utc)
+                now_utc = now_local.astimezone(timezone.utc)
+                return max(reset_local.astimezone(timezone.utc), now_utc + timedelta(minutes=1))
             except _ZINotFoundError:
                 pass
 
-    # "9:00 PM CDT on Thursday, May 22, 2026" -- bare 12H with TZ abbreviation or date
+    # "9:00 PM CDT on Thursday, May 22, 2026"
     m = _RESET_12H_RE.search(message)
     if m:
         time_str   = m.group(1)
@@ -303,10 +342,6 @@ def parse_reset_time(message):
                 except (ValueError, KeyError):
                     pass
         else:
-            # "9:00 PM CDT" -- TZ abbreviation but no date. Assume today (or
-            # tomorrow if that time has already passed) in the abbreviation's
-            # fixed UTC offset, the same fallback logic as the IANA-zone,
-            # date-less branch above.
             try:
                 parts = time_str.split(':')
                 h  = int(parts[0])
@@ -320,13 +355,10 @@ def parse_reset_time(message):
                 tz = timezone(timedelta(hours=offset_h))
                 now_local = datetime.now(tz)
                 reset_local = now_local.replace(hour=h, minute=mn, second=sc, microsecond=0)
-                # Only roll to the next day if the reset time passed more than
-                # 1 hour ago. A reset time that just barely passed (<= 1h) is
-                # the same boundary the script already waited for; adding a day
-                # would schedule 24h instead of a short retry.
-                if reset_local < now_local - timedelta(hours=1):
+                if reset_local < now_local - timedelta(hours=5):
                     reset_local += timedelta(days=1)
-                return reset_local.astimezone(timezone.utc)
+                now_utc = now_local.astimezone(timezone.utc)
+                return max(reset_local.astimezone(timezone.utc), now_utc + timedelta(minutes=1))
             except (ValueError, KeyError):
                 pass
 
@@ -354,7 +386,6 @@ _EXEC_WINDOW_RE = re.compile(
     r'^\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*(?:([A-Za-z_]+(?:/[A-Za-z_]+)+)|([A-Za-z]{2,4}))?\s*$'
 )
 
-# Day-of-week abbreviations -> Python weekday() int (Mon=0, Sun=6).
 _DAY_NAMES = {
     'mo': 0, 'mon': 0,
     'tu': 1, 'tue': 1,
@@ -365,7 +396,6 @@ _DAY_NAMES = {
     'su': 6, 'sun': 6,
 }
 
-# Optional day-of-week prefix before the HH:MM-HH:MM time portion, e.g. "Sa,Su ".
 _DAY_PREFIX_RE = re.compile(r'^([A-Za-z]{2,3}(?:,[A-Za-z]{2,3})*)\s+')
 
 
@@ -375,10 +405,7 @@ def parse_exec_windows(spec):
       { start: (h, m), end: (h, m), tz: tzinfo, days: frozenset|None }
     Multiple windows are separated by ';'. Each window:
       [DAY[,DAY...] ]HH:MM-HH:MM [IANA/Zone | TZABBR]
-    Day abbreviations (case-insensitive): Mo Tu We Th Fr Sa Su (also Mon-Sun).
-    A window where start > end wraps past midnight (e.g. 22:00-06:00).
-    tz defaults to UTC if omitted. days=None means all days (backward-compatible).
-    Returns [] for an empty/None spec, meaning no restriction -- always allowed.
+    Returns [] for an empty/None spec (no restriction).
     """
     windows = []
     if not spec:
@@ -424,6 +451,7 @@ def parse_exec_windows(spec):
 
 
 def _in_exec_window(now_utc, window):
+    """Return True if now_utc falls within the given window dict."""
     local = now_utc.astimezone(window['tz'])
     days = window.get('days')
     start_h, start_m = window['start']
@@ -441,9 +469,6 @@ def _in_exec_window(now_utc, window):
             return False
         return start_minutes <= cur_minutes < end_minutes
 
-    # Wrapping window (start > end, e.g. 18:00-06:00):
-    # open if today is an opening day and time >= start,
-    # or today is the day after an opening day and time < end.
     if cur_minutes >= start_minutes:
         return days is None or cur_weekday in days
     if cur_minutes < end_minutes:
@@ -453,8 +478,7 @@ def _in_exec_window(now_utc, window):
 
 
 def _next_exec_window_start(now_utc, window):
-    """UTC datetime of the next time this window opens, given now_utc is
-    currently outside it."""
+    """Return the UTC datetime of the next time this window opens."""
     local = now_utc.astimezone(window['tz'])
     start_h, start_m = window['start']
     candidate = local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
@@ -470,11 +494,19 @@ def _next_exec_window_start(now_utc, window):
 
 
 def _chunked_sleep(sleep_secs, wake_dt, label, _out):
-    """Sleep sleep_secs seconds, printing a progress line every _SLEEP_REPORT_INTERVAL seconds."""
+    """
+    Sleep for sleep_secs seconds in chunks, printing a progress line every
+    _SLEEP_REPORT_INTERVAL seconds. Returns actual seconds elapsed (monotonic).
+    """
+    t_start = time.monotonic()
     remaining = sleep_secs
     while remaining > 0:
         chunk = min(remaining, _SLEEP_REPORT_INTERVAL)
-        time.sleep(chunk)
+        try:
+            time.sleep(chunk)
+        except KeyboardInterrupt:
+            _interrupt_event.set()
+            raise
         remaining -= chunk
         if remaining > 0:
             still_left = max(0.0, (wake_dt - datetime.now(timezone.utc)).total_seconds())
@@ -482,33 +514,40 @@ def _chunked_sleep(sleep_secs, wake_dt, label, _out):
                 f'  {label} -- {still_left:.0f}s remaining '
                 f'(wake {wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")})'
             )
+    return time.monotonic() - t_start
 
 
-def wait_for_exec_window(windows, _out):
+def wait_for_exec_window(windows, _out, log_dir=None):
     """
-    Block until current time falls within one of the given windows.
-    No-op if windows is empty (unrestricted). Prints progress every
-    _SLEEP_REPORT_INTERVAL seconds. Re-checks the window after each sleep
-    to guard against clock skew and DST transitions.
+    Block until the current time falls within one of the given windows.
+    No-op (returns 0.0) if windows is empty. Logs wait events to run_events.txt.
+    Returns total seconds waited (excluding time already in-window).
     """
     if not windows:
-        return
+        return 0.0
     now = datetime.now(timezone.utc)
     if any(_in_exec_window(now, w) for w in windows):
-        return
+        return 0.0
+    total_waited = 0.0
     while True:
         now = datetime.now(timezone.utc)
         wake_dt = min(_next_exec_window_start(now, w) for w in windows)
         sleep_secs = max(0.0, (wake_dt - now).total_seconds())
-        _out(
-            f'  Exec window closed -- next window opens '
+        msg = (
+            f'Exec window closed -- next window opens '
             f'{wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")}; sleeping {sleep_secs:.0f}s'
         )
-        _chunked_sleep(sleep_secs, wake_dt, 'Exec window sleep', _out)
+        _out(f'  {msg}')
+        _log_run_event(log_dir, msg)
+        actual = _chunked_sleep(sleep_secs, wake_dt, 'Exec window sleep', _out)
+        total_waited += actual
         now = datetime.now(timezone.utc)
         if any(_in_exec_window(now, w) for w in windows):
             break
-    _out('  Exec window open -- proceeding.')
+    resume_msg = f'Exec window open -- proceeded (waited {total_waited:.0f}s total).'
+    _out(f'  {resume_msg}')
+    _log_run_event(log_dir, resume_msg)
+    return total_waited
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +561,7 @@ _BUILD_CONFIG_RE = re.compile(
 
 
 def _require_yaml():
+    """Exit with an error message if PyYAML is not installed."""
     if not _HAVE_YAML:
         print(
             'ERROR: PyYAML is required to parse YAML config. '
@@ -532,7 +572,10 @@ def _require_yaml():
 
 
 def load_plan_config(plan_text):
-    """Extract the Build Config YAML block from the plan, if present."""
+    """
+    Extract the Build Config YAML block from the plan document, if present.
+    Returns a dict of config keys, or {} if no block is found.
+    """
     m = _BUILD_CONFIG_RE.search(plan_text)
     if not m:
         return {}
@@ -541,6 +584,7 @@ def load_plan_config(plan_text):
 
 
 def load_config_file(path):
+    """Read a YAML config file from path and return its contents as a dict."""
     _require_yaml()
     try:
         with open(path, encoding='utf-8') as f:
@@ -554,9 +598,7 @@ def load_models_file(path):
     """
     Read a models list file (one model ID per line).
     Blank lines and lines starting with '#' are ignored.
-    Returns a dict mapping each model ID to itself (self-mapping aliases).
-    These entries can be used in plan Model: fields as full IDs and are
-    treated the same as any explicit alias in the models dict.
+    Returns a dict mapping each model ID to itself.
     """
     result = {}
     try:
@@ -573,15 +615,12 @@ def load_models_file(path):
 
 
 def merge_configs(plan_cfg, file_cfg):
-    """file_cfg values override plan_cfg values.
-
-    List-type keys (add_dirs, allowed_tools) are replaced in full -- not
-    appended. Only the models dict is deep-merged so partial alias overrides
-    work without clobbering aliases defined in the other source.
+    """
+    Merge two config dicts, with file_cfg values taking precedence.
+    The models dict is deep-merged; all other keys are replaced in full.
     """
     merged = dict(plan_cfg)
     merged.update(file_cfg)
-    # Deep-merge the models dict so partial overrides work.
     plan_models = plan_cfg.get('models', {})
     file_models = file_cfg.get('models', {})
     if plan_models or file_models:
@@ -593,8 +632,8 @@ def merge_configs(plan_cfg, file_cfg):
 
 def resolve_model(alias, config):
     """
-    Resolve 'haiku', 'sonnet', 'opus' (or a full model ID) to a full ID.
-    Lookup order: config models dict -> DEFAULT_MODEL_IDS -> pass through as-is.
+    Resolve a model alias ('haiku', 'sonnet', 'opus') or full model ID.
+    Lookup order: config models dict -> DEFAULT_MODEL_IDS -> pass through.
     """
     aliases = config.get('models') or {}
     return aliases.get(alias) or DEFAULT_MODEL_IDS.get(alias) or alias
@@ -602,9 +641,8 @@ def resolve_model(alias, config):
 
 def resolve_task_effort(task, cli_effort, config):
     """
-    Return the effective effort string for a task (or verification dict).
-    Precedence: CLI --effort (global override) > task Effort: field > config effort key.
-    Returns empty string when no effort is set at any level.
+    Return the effective effort string for a task.
+    Precedence: CLI --effort > task Effort: field > config effort key.
     """
     if cli_effort:
         return cli_effort
@@ -616,9 +654,8 @@ def resolve_task_effort(task, cli_effort, config):
 
 def resolve_task_exec_window(task, config):
     """
-    Return the effective exec-window spec string for a task (or verification
-    dict). Precedence: task ExecWindow: field > config exec_window key.
-    Returns '' (unrestricted) when neither is set.
+    Return the effective exec-window spec string for a task.
+    Precedence: task ExecWindow: field > config exec_window key.
     """
     task_window = (task.get('exec_window') or '').strip()
     if task_window:
@@ -628,15 +665,8 @@ def resolve_task_exec_window(task, config):
 
 def validate_config_types(config):
     """
-    Hard error (exit 1) when a config key expected to hold a specific type
-    holds an incompatible one. Catches YAML authoring mistakes -- e.g.
-    add_dirs: /some/path instead of add_dirs: [/some/path] -- before they
-    reach a crash site (models as a non-dict breaks resolve_model()) or
-    silently misbehave (add_dirs as a bare string iterates per-character
-    into bogus --add-dir flags; allowed_tools as a bare string raises an
-    unhandled TypeError when concatenated with a list in run_claude()).
-    A null/missing value for any of these keys is valid (treated as empty
-    by its caller) and is not an error.
+    Hard error (exit 1) when a config key holds an incompatible type.
+    Catches YAML authoring mistakes before they reach a crash or misbehave silently.
     """
     errors = []
     models = config.get('models')
@@ -665,11 +695,13 @@ _SECTION_END_RE  = re.compile(r'^(?:---|## )', re.MULTILINE)
 
 def _parse_fields_and_body(section_text):
     """
-    Given the text after a task heading line, return (model, files, prompt_body).
+    Given the text after a task heading line, return a tuple of
+    (model, files, effort, exec_window, prompt_body).
 
-    Per-task fields (Model:, Files:) appear immediately after the heading with
-    no blank lines between them. A blank line ends the fields block; everything
-    after that is the prompt body.
+    Per-task fields appear immediately after the heading with no blank lines
+    between them. A blank line ends the fields block; everything after is the
+    prompt body. Comment lines (starting with #) within the fields block are
+    skipped without ending it.
     """
     lines = section_text.lstrip('\n').split('\n')
     model = None
@@ -693,25 +725,20 @@ def _parse_fields_and_body(section_text):
                 exec_window = val
             field_end = i + 1
         elif stripped.startswith('#'):
-            # Comment line inside the fields block -- skip, do not advance field_end.
             continue
         elif stripped == '':
-            # Blank line ends the fields block; body starts after it.
             field_end = i + 1
             break
         else:
-            # Warn if this looks like a field with an unrecognized key.
             if re.match(r'^\w+:\s*\S', line):
                 print(
                     f'WARNING: unrecognized field in plan -- treated as prompt body: {line!r}',
                     file=sys.stderr,
                 )
-            # First non-field, non-comment, non-blank line starts the prompt body.
             field_end = i
             break
 
     prompt_lines = lines[field_end:]
-    # Strip leading and trailing blank lines from prompt body.
     while prompt_lines and prompt_lines[0].strip() == '':
         prompt_lines.pop(0)
     while prompt_lines and prompt_lines[-1].strip() == '':
@@ -721,10 +748,7 @@ def _parse_fields_and_body(section_text):
 
 
 def _section_end(text, start):
-    """
-    Return the index (in text) where the current section ends.
-    A section ends at the next --- rule or ## heading.
-    """
+    """Return the character index where the current section ends (--- or ## heading)."""
     tail = text[start:]
     m = _SECTION_END_RE.search(tail)
     return start + m.start() if m else len(text)
@@ -732,8 +756,9 @@ def _section_end(text, start):
 
 def parse_tasks(plan_text):
     """
-    Return a list of task dicts, sorted by task number:
-      { num, title, model, files, prompt_body }
+    Return a list of task dicts sorted by task number. Each dict contains:
+      { num, title, model, files, effort, exec_window, prompt_body }
+    Only headings matching "### Task N -- Title" (N a digit) are recognized.
     """
     headings = list(_TASK_HEADING_RE.finditer(plan_text))
     tasks = []
@@ -767,11 +792,8 @@ def parse_tasks(plan_text):
 
 def validate_tasks(tasks):
     """
-    Validate parsed tasks for collisions and numbering gaps.
-
-    Hard error (exit 1) on duplicate Task N numbers -- running the same task
-    twice can double-edit files. Warning only (stderr) on a non-gap-free or
-    non-1-start numbering sequence -- may be intentional during plan editing.
+    Validate parsed tasks for duplicate task numbers and non-sequential numbering.
+    Duplicate numbers cause a hard exit; non-sequential numbering is a warning only.
     """
     if not tasks:
         return
@@ -796,8 +818,7 @@ def validate_tasks(tasks):
 def warn_parallel_file_collisions(selected):
     """
     Warn (non-fatal) when multiple concurrently-selected tasks declare
-    overlapping Files: entries -- parallel workers writing the same file can
-    race and clobber each other's edits.
+    overlapping Files: entries.
     """
     by_file = {}
     for t in selected:
@@ -813,7 +834,8 @@ def warn_parallel_file_collisions(selected):
 
 def parse_verification(plan_text):
     """
-    Return { model, prompt_body } for the ## Verification section, or None.
+    Return a dict { model, effort, exec_window, prompt_body } for the
+    ## Verification section of the plan, or None if no such section exists.
     """
     m = _VERIFY_HEAD_RE.search(plan_text)
     if not m:
@@ -834,10 +856,11 @@ def parse_verification(plan_text):
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-def build_prompt(task_dict, config):
+def build_common_context(config):
     """
-    Prepend repo path, optional preamble, and optional license header to the
-    task's prompt body. Kept minimal to avoid unnecessary context overhead.
+    Build the shared context string (working dir, preamble, license header)
+    that is identical for every task in a run. Written once to common_context.txt
+    in the log directory; not repeated in per-task prompt log files.
     """
     parts = []
 
@@ -852,20 +875,37 @@ def build_prompt(task_dict, config):
     license_file = str(config.get('license_file') or '').strip()
     if license_file and license_file.lower() not in ('null', 'none'):
         if license_file not in _license_header_cache:
-            try:
-                _license_header_cache[license_file] = (
-                    Path(license_file).read_text(encoding='utf-8').rstrip()
-                )
-            except OSError as e:
-                print(f'WARNING: cannot read license_file {license_file}: {e}', file=sys.stderr)
-                _license_header_cache[license_file] = None
+            with _license_header_cache_lock:
+                if license_file not in _license_header_cache:
+                    try:
+                        _license_header_cache[license_file] = (
+                            Path(license_file).read_text(encoding='utf-8').rstrip()
+                        )
+                    except OSError as e:
+                        print(f'WARNING: cannot read license_file {license_file}: {e}', file=sys.stderr)
+                        _license_header_cache[license_file] = None
         header = _license_header_cache[license_file]
         if header is not None:
             parts.append(
                 'Use this exact license header for all new Python files:\n\n' + header
             )
 
-    if parts:
+    return '\n'.join(parts) if parts else ''
+
+
+def build_prompt(task_dict, config, common_context=None):
+    """
+    Construct the full prompt string to send to Claude for a given task.
+    If common_context is provided (pre-built by build_common_context()), it is
+    used directly to avoid re-reading the license file. Otherwise it is built
+    from config. The task body follows with a blank-line separator.
+    """
+    if common_context is None:
+        common_context = build_common_context(config)
+
+    parts = []
+    if common_context:
+        parts.append(common_context)
         parts.append('')  # blank line before prompt body
     parts.append(task_dict['prompt_body'])
     return '\n'.join(parts)
@@ -876,6 +916,11 @@ def build_prompt(task_dict, config):
 # ---------------------------------------------------------------------------
 
 def make_run_log_dir(config, plan_path, run_ts):
+    """
+    Create and return the Path of the per-run log directory.
+    Location: config log_dir (or sibling tmp_build_logs/ of the plan file's
+    parent) / <plan_stem>_<run_ts>.
+    """
     base = str(config.get('log_dir') or '').strip()
     if not base:
         base = str(Path(plan_path).resolve().parent.parent / 'tmp_build_logs')
@@ -886,19 +931,26 @@ def make_run_log_dir(config, plan_path, run_ts):
 
 
 def write_log(log_dir, filename, content):
+    """Write content to log_dir/filename (UTF-8). Returns the Path written."""
     p = log_dir / filename
     p.write_text(content, encoding='utf-8')
     return p
 
 
 def write_completion_marker(log_dir, task_num, task_title, exit_code):
-    """Write a marker file for a finished task.
-
-    Filename ends with _completed.txt on exit 0, _failed.txt otherwise.
+    """
+    Write a small marker file indicating a task finished.
+    Filename ends with _completed.txt (exit 0), _interrupted.txt (RC_INTERRUPTED),
+    or _failed.txt (any other non-zero exit).
     """
     ts       = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
     date_str = ts[:10]
-    status   = 'completed' if exit_code == 0 else 'failed'
+    if exit_code == 0:
+        status = 'completed'
+    elif exit_code == RC_INTERRUPTED:
+        status = 'interrupted'
+    else:
+        status = 'failed'
     filename = f'task_{task_num}_{date_str}_{status}.txt'
     content = (
         f'task: {task_num}\n'
@@ -913,23 +965,38 @@ def write_completion_marker(log_dir, task_num, task_title, exit_code):
 # Claude invocation
 # ---------------------------------------------------------------------------
 
-def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_tools=None, extra_claude_args=None, _lines=None, exec_windows=None):
+def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_tools=None, extra_claude_args=None, _lines=None, exec_windows=None, task_body=None):
     """
-    Pipe prompt to claude on stdin. Capture stdout+stderr to log files
-    and echo to the terminal. Return (exit_code, usage_dict).
+    Pipe prompt to the claude CLI on stdin and capture stdout + stderr to
+    timestamped log files, echoing output to the terminal (or buffering it
+    in _lines for parallel execution). Returns (exit_code, usage_dict).
+
     usage_dict keys: input_tokens, output_tokens, cache_read_input_tokens,
     cache_creation_input_tokens. All zero on failure or dry-run.
+
+    task_body: if provided, this string is written to the per-task prompt log
+               file instead of the full prompt. The full prompt (common context
+               + task body) is still sent to Claude. Pass task['prompt_body']
+               to avoid repeating the common context across per-task log files.
+
     add_dirs: list of directory paths to pass via --add-dir.
-    _lines: if a list, append output lines to it instead of printing (for
-            parallel execution -- caller prints the buffer atomically).
-    exec_windows: parsed list from parse_exec_windows(), or None/[] for no
-            restriction. Checked before every attempt, including attempts
-            after a rate-limit retry wake-up.
-    Output token count is printed as a dedicated line. On a 429/rate-limit
-    response that includes a reset time, sleeps until (reset_time + 10
-    minutes) and retries, up to _MAX_RATE_LIMIT_RETRIES times. Raises
-    RateLimitError if rate-limited with no parseable reset time or if all
-    retries are exhausted.
+    allowed_tools: list of tool names; defaults to DEFAULT_ALLOWED_TOOLS.
+    extra_claude_args: additional CLI flags passed through verbatim.
+    _lines: if a list, append output lines to it instead of printing.
+    exec_windows: parsed result of parse_exec_windows(). Checked before every
+                  attempt, including after a rate-limit wake-up. Wait time is
+                  NOT counted in the reported elapsed time.
+
+    Ctrl-C (KeyboardInterrupt) is caught during proc.communicate() and during
+    sleep. The subprocess is terminated, an interrupted log file is written,
+    and KeyboardInterrupt is re-raised for the caller to handle.
+
+    Retry behavior: on a rate-limit response with a parseable reset time, sleeps
+    until (reset_time + 1 min) and retries, up to _MAX_RATE_LIMIT_RETRIES times.
+    Sleep time is NOT counted in the reported elapsed time.
+
+    Raises RateLimitError, SpendLimitError, FatalInvocationError, or
+    KeyboardInterrupt.
     """
     def _out(s=''):
         if _lines is not None:
@@ -937,8 +1004,9 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         else:
             print(s)
 
-    ts = datetime.now(timezone.utc).strftime('%H:%M:%S+00:00')
-    prompt_log = write_log(log_dir, f'{label}_{ts}_prompt.txt', prompt)
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
+    log_content = task_body if task_body is not None else prompt
+    prompt_log = write_log(log_dir, f'{label}_{ts}_prompt.txt', log_content)
     _out(f'  prompt  -> {prompt_log}')
 
     _zero_usage = {
@@ -947,9 +1015,9 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
     }
 
     if dry_run:
-        _out('-- DRY RUN: prompt follows --')
-        _out(prompt)
-        _out('-- END prompt --')
+        _out('-- DRY RUN: task body follows --')
+        _out(log_content)
+        _out('-- END task body --')
         return 0, _zero_usage
 
     tools = allowed_tools or DEFAULT_ALLOWED_TOOLS
@@ -959,19 +1027,23 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         claude_cmd += ['--add-dir', d]
     claude_cmd += (extra_claude_args or [])
 
-    cmd = claude_cmd
-
     _long_no_output_strikes = 0
     _prev_was_rate_limit = False
     attempt = 0
+    total_run_secs = 0.0  # subprocess CPU time only; excludes all sleep/wait
+
     while True:
+        # Check for a pending interrupt before starting each attempt.
+        if _interrupt_event.is_set():
+            raise KeyboardInterrupt('Interrupted by user')
+
         attempt += 1
-        wait_for_exec_window(exec_windows, _out)
-        run_ts = datetime.now(timezone.utc).strftime('%H:%M:%S+00:00')
+        wait_for_exec_window(exec_windows, _out, log_dir)
+        run_ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
         t0 = time.monotonic()
 
         proc = subprocess.Popen(
-            cmd,
+            claude_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -980,10 +1052,40 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         )
         # KNOWN ISSUE: proc.communicate() has no timeout. A subprocess that
         # never exits blocks this thread indefinitely. _FATAL_TIMEOUT_SECS
-        # only fires AFTER communicate() returns. Desired behavior: let the
-        # claude CLI manage its own lifecycle; no hard kill from this script.
-        raw, err = proc.communicate(input=prompt)
+        # only fires AFTER communicate() returns.
+        try:
+            raw, err = proc.communicate(input=prompt)
+        except KeyboardInterrupt:
+            _interrupt_event.set()
+            elapsed = time.monotonic() - t0
+            total_run_secs += elapsed
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
+            interrupted_note = (
+                f'[INTERRUPTED by Ctrl-C after {elapsed:.1f}s '
+                f'(attempt {attempt}, total process time {total_run_secs:.1f}s)]'
+            )
+            _out(interrupted_note)
+            _log_run_event(
+                log_dir,
+                f'{label}: INTERRUPTED after {elapsed:.1f}s process time '
+                f'(attempt {attempt}); total process time {total_run_secs:.1f}s',
+            )
+            write_log(
+                log_dir,
+                f'{label}_{run_ts}_attempt{attempt}_interrupted.txt',
+                interrupted_note,
+            )
+            raise
+
         elapsed = time.monotonic() - t0
+        total_run_secs += elapsed
 
         # Parse JSON response; fall back to raw text on failure.
         usage = dict(_zero_usage)
@@ -1008,14 +1110,22 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
             f'  ({elapsed:.1f}s, {int(elapsed) // 60}m{elapsed % 60:.3f}s, exit {proc.returncode})'
             f'  tokens: in={tok_in} out={tok_out} cache_read={tok_cr} cache_write={tok_cw}'
         )
-        _out(f'Return code: claude[{proc.pid}]: {proc.returncode}')
-        _out(f'  output tokens: {tok_out}')
+        _out(f'  Return code: claude[{proc.pid}]: {proc.returncode}')
         _out(text_output)
 
+        # text_output has the decoded human-readable result; search it first
+        # so natural-language time patterns resolve correctly.
+        combined = text_output + '\n' + raw + '\n' + err
+
+        # Check for monthly spend limit before the long-no-output fatal check.
+        if _SPEND_LIMIT_RE.search(combined):
+            _log_run_event(log_dir, f'{label}: spend limit reached (attempt {attempt})')
+            raise SpendLimitError(
+                (text_output.strip() or 'monthly spend limit reached')[:300]
+            )
+
         # All three conditions must hold: process ran >29 min, exited non-zero,
-        # and produced no output. One such occurrence is tolerated (the attempt
-        # may still be retried if it is also a rate-limit hit). A second
-        # occurrence within the same task's retry loop is fatal.
+        # and produced no output. One such occurrence is tolerated; a second is fatal.
         if elapsed > _FATAL_TIMEOUT_SECS and proc.returncode != 0 and not text_output.strip():
             _long_no_output_strikes += 1
             if _long_no_output_strikes >= 2 or _prev_was_rate_limit:
@@ -1023,6 +1133,11 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
                     'previous attempt was a rate-limit hit'
                     if _prev_was_rate_limit
                     else 'second occurrence'
+                )
+                _log_run_event(
+                    log_dir,
+                    f'{label}: fatal invocation error ({reason}) -- '
+                    f'total process time {total_run_secs:.1f}s',
                 )
                 raise FatalInvocationError(
                     f'invocation ran {elapsed:.0f}s (>{_FATAL_TIMEOUT_SECS}s), '
@@ -1034,25 +1149,7 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
                 f'(strike 1 of 2 before fatal; exit {proc.returncode})'
             )
 
-        # text_output has the decoded human-readable result (JSON unescaped);
-        # search it first so natural-language time patterns resolve correctly.
-        combined = text_output + '\n' + raw + '\n' + err
-
-        if _SPEND_LIMIT_RE.search(combined):
-            raise SpendLimitError(
-                (text_output.strip() or 'monthly spend limit reached')[:300]
-            )
-
-        # Require the rate-limit keyword regardless of signal source, so a
-        # successful response that merely echoes a time+timezone string
-        # cannot false-positive. Exit code != 0 OR a specific, low-false-
-        # positive reset-time pattern (IANA time/date, ISO 8601, or a
-        # relative "retry in N seconds/minutes/hours" phrase) is accepted as
-        # the secondary signal, catching limits that report exit 0 in any of
-        # parse_reset_time()'s supported formats. The bare 12-hour-clock
-        # pattern (_RESET_12H_RE, e.g. a lone "9:00 PM") is deliberately
-        # excluded here -- it is too generic to use as a standalone signal
-        # on a successful exit.
+        # Rate-limit detection: require keyword + secondary signal.
         is_limit = bool(_RATE_LIMIT_RE.search(combined)) and (
             proc.returncode != 0
             or bool(_RESET_TIME_IANA_RE.search(combined))
@@ -1063,30 +1160,47 @@ def run_claude(prompt, model, dry_run, log_dir, label, add_dirs=None, allowed_to
         if is_limit:
             reset_dt = parse_reset_time(combined)
             if reset_dt is not None and attempt <= _MAX_RATE_LIMIT_RETRIES:
-                wake_dt    = reset_dt + timedelta(minutes=10)
+                wake_dt    = reset_dt + timedelta(minutes=1)
                 now_dt     = datetime.now(timezone.utc)
                 sleep_secs = max(0.0, (wake_dt - now_dt).total_seconds())
-                _out(
-                    f'  Rate limit -- resets '
+                limit_msg = (
+                    f'Rate limit -- resets '
                     f'{reset_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")}; '
                     f'sleeping {sleep_secs:.0f}s '
                     f'(wake {wake_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")})'
                 )
-                _chunked_sleep(sleep_secs, wake_dt, 'Rate limit sleep', _out)
-                _out('  Retrying ...')
+                _out(f'  {limit_msg}')
+                _log_run_event(log_dir, f'{label}: {limit_msg}')
+                actual_slept = _chunked_sleep(sleep_secs, wake_dt, 'Rate limit sleep', _out)
+                resume_msg = (
+                    f'Rate limit sleep complete: slept {actual_slept:.0f}s; '
+                    f'retrying (attempt {attempt + 1})'
+                )
+                _out(f'  {resume_msg}')
+                _log_run_event(log_dir, f'{label}: {resume_msg}')
                 _prev_was_rate_limit = True
                 continue
+            _log_run_event(
+                log_dir,
+                f'{label}: rate limit -- no parseable reset time or retries exhausted',
+            )
             raise RateLimitError(text_output.strip()[:300])
 
         break
 
+    _log_run_event(
+        log_dir,
+        f'{label}: completed (attempt {attempt}, exit {proc.returncode}, '
+        f'process time {total_run_secs:.1f}s)',
+    )
     return proc.returncode, usage
 
 
-def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed_tools=None, extra_claude_args=None, exec_windows=None):
+def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed_tools=None, extra_claude_args=None, exec_windows=None, task_body=None):
     """
-    Worker for parallel execution. Buffers all output, returns
-    (task_num, rc, usage, lines) where lines is a list of strings to print.
+    Worker function for parallel task execution via ThreadPoolExecutor.
+    Buffers all output into a list and returns it atomically.
+    Returns (task_num, rc, usage, lines).
     """
     lines = [
         '',
@@ -1100,7 +1214,16 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
         lines.append(f'  files: {", ".join(task["files"])}')
     lines.append('=' * 70)
 
-    rc, usage = run_claude(prompt, model, dry_run, log_dir, label, add_dirs, allowed_tools, extra_claude_args, _lines=lines, exec_windows=exec_windows)
+    try:
+        rc, usage = run_claude(
+            prompt, model, dry_run, log_dir, label, add_dirs, allowed_tools,
+            extra_claude_args, _lines=lines, exec_windows=exec_windows,
+            task_body=task_body,
+        )
+    except KeyboardInterrupt:
+        marker = write_completion_marker(log_dir, task['num'], task['title'], RC_INTERRUPTED)
+        lines.append(f'  marker  -> {marker}')
+        raise
     marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
     lines.append(f'  marker  -> {marker}')
     return task['num'], rc, usage, lines
@@ -1111,9 +1234,10 @@ def _task_worker(task, model, prompt, dry_run, log_dir, label, add_dirs, allowed
 # ---------------------------------------------------------------------------
 
 def build_arg_parser():
+    """Construct and return the ArgumentParser for autobuilderclaude."""
     p = argparse.ArgumentParser(
         prog='autobuilderclaude',
-        description='autobuilderclaude v1.6.9 -- Document-driven Claude task runner (autobuilderclaude format v1).',
+        description='autobuilderclaude v1.9.0 -- Document-driven Claude task runner (autobuilderclaude format v1).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Plan format:   autobuilderclaude_plan_template_v1.md\n'
@@ -1135,7 +1259,7 @@ def build_arg_parser():
     p.add_argument('--stop-after', metavar='N', type=int,
                    help='Stop after task N completes (inclusive); verification is skipped')
     p.add_argument('--model',    metavar='MODEL',
-                   help='Override per-task model (haiku|sonnet|opus, a full Claude model ID, or a provider/model:tag ID such as nvidia/nemotron-3-super-120b-a12b:free)')
+                   help='Override per-task model (haiku|sonnet|opus, a full Claude model ID, or a provider/model:tag ID)')
     p.add_argument('--effort',   metavar='LEVEL',
                    choices=['low', 'medium', 'high', 'xhigh', 'max'],
                    help='Global effort level (low|medium|high|xhigh|max); overrides per-task Effort: field and config effort key')
@@ -1153,6 +1277,22 @@ def build_arg_parser():
 # ---------------------------------------------------------------------------
 
 def main():
+    """
+    Entry point. Parse arguments, load and merge configs, select tasks, and
+    execute them sequentially or in parallel via ThreadPoolExecutor.
+
+    Execution order:
+    1. Parse CLI args; collect unrecognized args as pass-through to claude.
+    2. Load and merge configs: template < plan Build Config < --config file.
+    3. Parse tasks and optional verification from the plan document.
+    4. Apply --task / --start-task / --stop-after task selection filters.
+    5. Build common context once; write to common_context.txt.
+    6. Run selected tasks (sequential or parallel based on --parallel).
+    7. Run verification if present and not suppressed by --stop-after.
+    8. Print aggregate token usage and exit with the worst task exit code.
+
+    Exits with RC_INTERRUPTED (130) on Ctrl-C.
+    """
     parser = build_arg_parser()
     args, extra_args = parser.parse_known_args()
 
@@ -1177,8 +1317,6 @@ def main():
 
     validate_config_types(config)
 
-    # Load models_file if specified: self-map each model ID as an alias.
-    # Explicit models: entries in config take precedence over models_file entries.
     models_file_path = str(config.get('models_file', '') or '').strip()
     if models_file_path and models_file_path.lower() not in ('null', 'none', ''):
         file_models = load_models_file(models_file_path)
@@ -1200,8 +1338,6 @@ def main():
         print('ERROR: no tasks or verification section found in plan.', file=sys.stderr)
         sys.exit(1)
 
-    # Pass-through args go to every claude invocation unchanged.
-    # Effort is resolved per-task via resolve_task_effort(); --effort is the global override.
     pass_through_args = extra_args
 
     # --list
@@ -1271,7 +1407,6 @@ def main():
         selected   = tasks
         run_verify = verification is not None
 
-    # --stop-after: trim the selected list and suppress verification.
     if args.stop_after is not None:
         selected   = [t for t in selected if t['num'] <= args.stop_after]
         run_verify = False
@@ -1288,6 +1423,13 @@ def main():
     _extra_dirs = config.get('add_dirs') or []
     add_dirs = [d for d in ([str(config.get('repo') or '').strip()] + list(_extra_dirs)) if d]
     allowed_tools_list = config.get('allowed_tools') or DEFAULT_ALLOWED_TOOLS
+
+    # Build common context once; write to shared file; print location once.
+    common_context = build_common_context(config)
+    if common_context:
+        cc_path = write_log(log_dir, 'common_context.txt', common_context)
+        print(f'Common context -> {cc_path}')
+
     print(f'Log dir: {log_dir}')
     if args.effort:
         print(f'Effort (global override): {args.effort}')
@@ -1297,6 +1439,16 @@ def main():
         print(f'Stop after: task {args.stop_after}')
     if args.parallel > 1:
         print(f'Parallel: {args.parallel} workers')
+
+    # In dry-run mode, print the common context once before any task output.
+    if args.dry_run and common_context:
+        print()
+        print('-- DRY RUN: common context (shared by all tasks) --')
+        print(common_context)
+        print('-- END common context --')
+
+    task_nums = [t['num'] for t in selected]
+    _log_run_event(log_dir, f'Run started: plan={plan_path} tasks={task_nums}')
 
     default_model = config.get('default_model', 'sonnet')
     exit_code  = 0
@@ -1315,134 +1467,174 @@ def main():
             print(f'WARNING: {label} exited {rc}', file=sys.stderr)
             exit_code = rc
 
-    if args.parallel > 1 and len(selected) > 1:
-        warn_parallel_file_collisions(selected)
+    try:
+        if args.parallel > 1 and len(selected) > 1:
+            warn_parallel_file_collisions(selected)
 
-        # Build all (task, model, prompt, label, task_claude_args) tuples up front.
-        work_items = []
-        for task in selected:
-            model_key = args.model or task['model'] or default_model
-            model     = resolve_model(model_key, config)
-            safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
-            label      = f'task_{task["num"]:03d}_{safe_title}'
-            prompt     = build_prompt(task, config)
-            effort     = resolve_task_effort(task, args.effort, config)
-            task_claude_args = (['--effort', effort] if effort else []) + pass_through_args
-            exec_windows = parse_exec_windows(resolve_task_exec_window(task, config))
-            work_items.append((task, model, prompt, label, task_claude_args, exec_windows))
+            work_items = []
+            for task in selected:
+                model_key  = args.model or task['model'] or default_model
+                model      = resolve_model(model_key, config)
+                safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
+                label      = f'task_{task["num"]:03d}_{safe_title}'
+                prompt     = build_prompt(task, config, common_context)
+                effort     = resolve_task_effort(task, args.effort, config)
+                task_claude_args = (['--effort', effort] if effort else []) + pass_through_args
+                exec_windows = parse_exec_windows(resolve_task_exec_window(task, config))
+                work_items.append((task, model, prompt, label, task_claude_args, exec_windows))
 
-        # Explicit try/finally (not `with`) so every exit path -- success,
-        # RateLimitError, or any other worker exception -- gets the fast
-        # non-blocking shutdown. ThreadPoolExecutor.__exit__ defaults to
-        # shutdown(wait=True), which would block on all other in-flight
-        # workers (potentially hours, if any are sleeping in an exec-window
-        # or rate-limit wait) before an unhandled exception's traceback
-        # surfaces.
-        executor = ThreadPoolExecutor(max_workers=args.parallel)
-        try:
-            futures = {
-                executor.submit(
-                    _task_worker, task, model, prompt, args.dry_run, log_dir, label, add_dirs, allowed_tools_list, task_claude_args, exec_windows
-                ): task['num']
-                for task, model, prompt, label, task_claude_args, exec_windows in work_items
-            }
-            for future in as_completed(futures):
-                try:
-                    task_num, rc, usage, lines = future.result()
-                except FatalInvocationError as e:
+            executor = ThreadPoolExecutor(max_workers=args.parallel)
+            try:
+                futures = {
+                    executor.submit(
+                        _task_worker,
+                        task, model, prompt, args.dry_run, log_dir, label,
+                        add_dirs, allowed_tools_list, task_claude_args,
+                        exec_windows, task['prompt_body'],
+                    ): task['num']
+                    for task, model, prompt, label, task_claude_args, exec_windows in work_items
+                }
+                for future in as_completed(futures):
+                    try:
+                        task_num, rc, usage, lines = future.result()
+                    except KeyboardInterrupt:
+                        _interrupt_event.set()
+                        with print_lock:
+                            print('\nInterrupted (Ctrl-C).', file=sys.stderr)
+                        raise
+                    except FatalInvocationError as e:
+                        with print_lock:
+                            print(f'\nFATAL: {e}', file=sys.stderr)
+                            print('Remaining tasks skipped.', file=sys.stderr)
+                        _log_run_event(log_dir, f'Run aborted: fatal invocation error')
+                        sys.exit(1)
+                    except SpendLimitError as e:
+                        with print_lock:
+                            print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
+                            print('Raise it at claude.ai/settings/usage', file=sys.stderr)
+                            print('Remaining tasks skipped.', file=sys.stderr)
+                        _log_run_event(log_dir, f'Run aborted: spend limit reached')
+                        sys.exit(1)
+                    except RateLimitError as e:
+                        with print_lock:
+                            print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
+                            print('Remaining tasks skipped.', file=sys.stderr)
+                        _log_run_event(log_dir, f'Run aborted: rate limit exhausted')
+                        sys.exit(1)
                     with print_lock:
-                        print(f'\nFATAL: {e}', file=sys.stderr)
-                        print('Remaining tasks skipped.', file=sys.stderr)
+                        print('\n'.join(lines))
+                    _accumulate(rc, usage, task_num)
+            except KeyboardInterrupt:
+                _log_run_event(log_dir, 'Run INTERRUPTED by user (Ctrl-C) during parallel execution')
+                print('Canceling remaining tasks...', file=sys.stderr)
+                raise
+            finally:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
+
+        else:
+            for task in selected:
+                model_key  = args.model or task['model'] or default_model
+                model      = resolve_model(model_key, config)
+                safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
+                label      = f'task_{task["num"]:03d}_{safe_title}'
+                effort     = resolve_task_effort(task, args.effort, config)
+                task_claude_args = (['--effort', effort] if effort else []) + pass_through_args
+                exec_windows = parse_exec_windows(resolve_task_exec_window(task, config))
+
+                print()
+                print('=' * 70)
+                print(f'  Task {task["num"]} -- {task["title"]}')
+                print(f'  model: {model}')
+                if task_claude_args:
+                    print(f'  claude args: {" ".join(task_claude_args)}')
+                if task['files']:
+                    print(f'  files: {", ".join(task["files"])}')
+                print('=' * 70)
+
+                prompt = build_prompt(task, config, common_context)
+                _log_run_event(log_dir, f'Task {task["num"]} ({task["title"]}): starting')
+                try:
+                    rc, usage = run_claude(
+                        prompt, model, args.dry_run, log_dir, label,
+                        add_dirs, allowed_tools_list, task_claude_args,
+                        exec_windows=exec_windows,
+                        task_body=task['prompt_body'],
+                    )
+                except KeyboardInterrupt:
+                    _log_run_event(log_dir, f'Task {task["num"]}: INTERRUPTED by user')
+                    write_completion_marker(log_dir, task['num'], task['title'], RC_INTERRUPTED)
+                    raise
+                except FatalInvocationError as e:
+                    print(f'\nFATAL: {e}', file=sys.stderr)
+                    print('Remaining tasks skipped.', file=sys.stderr)
+                    _log_run_event(log_dir, f'Task {task["num"]}: fatal invocation error -- run aborted')
                     sys.exit(1)
                 except SpendLimitError as e:
-                    with print_lock:
-                        print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
-                        print('Raise it at claude.ai/settings/usage', file=sys.stderr)
-                        print('Remaining tasks skipped.', file=sys.stderr)
+                    print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
+                    print('Raise it at claude.ai/settings/usage', file=sys.stderr)
+                    print('Remaining tasks skipped.', file=sys.stderr)
+                    _log_run_event(log_dir, f'Task {task["num"]}: spend limit -- run aborted')
                     sys.exit(1)
                 except RateLimitError as e:
-                    with print_lock:
-                        print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
-                        print('Remaining tasks skipped.', file=sys.stderr)
+                    print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
+                    print('Remaining tasks skipped.', file=sys.stderr)
+                    _log_run_event(log_dir, f'Task {task["num"]}: rate limit exhausted -- run aborted')
                     sys.exit(1)
-                with print_lock:
-                    print('\n'.join(lines))
-                _accumulate(rc, usage, task_num)
-        finally:
-            try:
-                executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                # cancel_futures added in Python 3.9; fall back on 3.8.
-                executor.shutdown(wait=False)
-    else:
-        for task in selected:
-            model_key = args.model or task['model'] or default_model
-            model     = resolve_model(model_key, config)
-            safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', task['title'])[:40]
-            label      = f'task_{task["num"]:03d}_{safe_title}'
-            effort     = resolve_task_effort(task, args.effort, config)
-            task_claude_args = (['--effort', effort] if effort else []) + pass_through_args
-            exec_windows = parse_exec_windows(resolve_task_exec_window(task, config))
+                marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
+                print(f'  marker  -> {marker}')
+                _accumulate(rc, usage, task['num'])
+
+        if run_verify and verification:
+            model_key    = args.model or verification['model']
+            model        = resolve_model(model_key, config)
+            effort       = resolve_task_effort(verification, args.effort, config)
+            verify_claude_args = (['--effort', effort] if effort else []) + pass_through_args
+            exec_windows = parse_exec_windows(resolve_task_exec_window(verification, config))
 
             print()
             print('=' * 70)
-            print(f'  Task {task["num"]} -- {task["title"]}')
+            print(f'  Verification')
             print(f'  model: {model}')
-            if task_claude_args:
-                print(f'  claude args: {" ".join(task_claude_args)}')
-            if task['files']:
-                print(f'  files: {", ".join(task["files"])}')
+            if verify_claude_args:
+                print(f'  claude args: {" ".join(verify_claude_args)}')
             print('=' * 70)
 
-            prompt = build_prompt(task, config)
+            prompt = build_prompt(verification, config, common_context)
+            _log_run_event(log_dir, 'Verification: starting')
             try:
-                rc, usage = run_claude(prompt, model, args.dry_run, log_dir, label, add_dirs, allowed_tools_list, task_claude_args, exec_windows=exec_windows)
+                rc, usage = run_claude(
+                    prompt, model, args.dry_run, log_dir, 'verify',
+                    add_dirs, allowed_tools_list, verify_claude_args,
+                    exec_windows=exec_windows,
+                    task_body=verification['prompt_body'],
+                )
+            except KeyboardInterrupt:
+                _log_run_event(log_dir, 'Verification: INTERRUPTED by user')
+                raise
             except FatalInvocationError as e:
                 print(f'\nFATAL: {e}', file=sys.stderr)
-                print('Remaining tasks skipped.', file=sys.stderr)
+                _log_run_event(log_dir, 'Verification: fatal invocation error -- run aborted')
                 sys.exit(1)
             except SpendLimitError as e:
                 print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
                 print('Raise it at claude.ai/settings/usage', file=sys.stderr)
-                print('Remaining tasks skipped.', file=sys.stderr)
+                _log_run_event(log_dir, 'Verification: spend limit -- run aborted')
                 sys.exit(1)
             except RateLimitError as e:
                 print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
-                print('Remaining tasks skipped.', file=sys.stderr)
+                _log_run_event(log_dir, 'Verification: rate limit exhausted -- run aborted')
                 sys.exit(1)
-            marker = write_completion_marker(log_dir, task['num'], task['title'], rc)
-            print(f'  marker  -> {marker}')
-            _accumulate(rc, usage, task['num'])
+            _accumulate(rc, usage)
 
-    if run_verify and verification:
-        model_key    = args.model or verification['model']
-        model        = resolve_model(model_key, config)
-        effort       = resolve_task_effort(verification, args.effort, config)
-        verify_claude_args = (['--effort', effort] if effort else []) + pass_through_args
-        exec_windows = parse_exec_windows(resolve_task_exec_window(verification, config))
+        _log_run_event(log_dir, f'Run completed: exit_code={exit_code}')
 
-        print()
-        print('=' * 70)
-        print(f'  Verification')
-        print(f'  model: {model}')
-        if verify_claude_args:
-            print(f'  claude args: {" ".join(verify_claude_args)}')
-        print('=' * 70)
-
-        prompt = build_prompt(verification, config)
-        try:
-            rc, usage = run_claude(prompt, model, args.dry_run, log_dir, 'verify', add_dirs, allowed_tools_list, verify_claude_args, exec_windows=exec_windows)
-        except FatalInvocationError as e:
-            print(f'\nFATAL: {e}', file=sys.stderr)
-            sys.exit(1)
-        except SpendLimitError as e:
-            print(f'\nERROR: monthly spend limit -- {e}', file=sys.stderr)
-            print('Raise it at claude.ai/settings/usage', file=sys.stderr)
-            sys.exit(1)
-        except RateLimitError as e:
-            print(f'\nERROR: rate limit reached -- {e}', file=sys.stderr)
-            sys.exit(1)
-        _accumulate(rc, usage)
+    except KeyboardInterrupt:
+        print(f'\nInterrupted (Ctrl-C). Exit code {RC_INTERRUPTED}.', file=sys.stderr)
+        _log_run_event(log_dir, f'Run terminated by user (Ctrl-C): exit_code={RC_INTERRUPTED}')
+        sys.exit(RC_INTERRUPTED)
 
     print()
     print(

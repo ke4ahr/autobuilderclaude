@@ -219,11 +219,11 @@ any sleeping through an exec-window or rate-limit wait) to finish first.
 ## Token usage
 
 Token counts are printed after each task on the output line, followed by a
-dedicated output-token line:
+return code line:
 
 ```
-  output  -> /path/to/1997-07-16T19:20:30+00:00_output.txt  (4.2s, exit 0)  tokens: in=1234 out=567 cache_read=890 cache_write=0
-  output tokens: 567
+  output  -> /path/to/1997-07-16T19:20:30+00:00_output.txt  (4.2s, 0m4.200s, exit 0)  tokens: in=1234 out=567 cache_read=890 cache_write=0
+  Return code: claude[12345]: 0
 ```
 
 A cumulative total is printed at the end of the run:
@@ -274,13 +274,29 @@ Example: `Tu,Th 18:00-06:00 America/Chicago` -- open Tuesday 18:00 through Wedne
 | `Tu,Th 18:00-06:00 America/Chicago` | Tuesday and Thursday nights, wrapping to Wed/Fri 06:00 |
 | `Mo,Tu,We,Th,Fr 17:00-08:00 CDT; Sa,Su 00:00-00:00 CDT` | Weeknights + all weekend |
 
+## Monthly spend limit
+
+When the Claude CLI outputs "You've hit your monthly spend limit", the script
+exits immediately with a non-zero code and prints:
+
+```
+ERROR: monthly spend limit -- <message excerpt>
+Raise it at claude.ai/settings/usage
+Remaining tasks skipped.
+```
+
+Unlike the 5-hour and 7-day usage quotas (which auto-reset at a known time and
+are handled by the sleep-and-retry mechanism below), the monthly spend limit
+requires a user action -- raising the billing cap at `claude.ai/settings/usage`.
+Sleeping and retrying is wrong behavior for this case, so none is attempted.
+
 ## Rate-limit handling
 
 When claude's output contains a usage-rate-limit message, the script attempts to
 extract a reset time from the message. The message must first match one of the
-recognized limit-keyword phrases: `hit your limit`, `hit your <word> limit` (e.g.
-"hit your session limit", "hit your weekly limit" -- any single word between
-"your" and "limit"), `usage limit`, `rate limit`/`rate-limit`, `exceeded ... limit`,
+recognized limit-keyword phrases: `hit your limit`, `hit your <word(s)> limit`
+(up to 3 qualifier words, e.g. "hit your session limit", "hit your monthly spend
+limit"), `usage limit`, `rate limit`/`rate-limit`, `exceeded ... limit`,
 or `limit ... exceeded`. If the keyword matches, it is treated as a real rate
 limit if claude exited non-zero, OR -- on exit 0 -- the message matches one of the
 low-false-positive reset-time patterns below (ISO 8601, an IANA-zone date or time,
@@ -293,15 +309,16 @@ non-zero. Five reset-time formats are recognized:
 - 12-hour clock with TZ abbreviation, with or without a date (e.g.
   `9:00 PM CDT on Thursday, May 22, 2026` or just `9:00 PM CDT`). When no date is
   given, today is assumed; tomorrow is assumed only if the time passed more than
-  1 hour ago. A reset time that passed within the last hour is treated as the
+  5 hours ago. A reset time that passed within the last 5 hours is treated as the
   current reset boundary (resulting in an immediate retry rather than a 24-hour
   wait), guarding against repeated day-rollover when the script wakes slightly
-  late from an earlier rate-limit sleep.
+  late from an earlier rate-limit sleep. 5 hours is the shortest Claude quota
+  window.
 - Relative offsets (e.g. `retry after 60 seconds`)
 - Date + time + IANA zone (e.g. `May 26, 12pm (America/Chicago)`)
 - Time-only + IANA zone (e.g. `7:20am (America/Chicago)`). When no date is given,
-  today is assumed; tomorrow is assumed only if the time passed more than 1 hour
-  ago (same 1-hour-grace logic as the TZ-abbreviation format above).
+  today is assumed; tomorrow is assumed only if the time passed more than 5 hours
+  ago (same 5-hour-grace logic as the TZ-abbreviation format above).
 
 If a reset time is found, the script sleeps until (reset_time + 10 minutes)
 and then retries the failing task automatically, up to 3 times:
@@ -857,3 +874,29 @@ SPDX-License-Identifier: GPL-3.0-or-later
   Examples: "Sa,Su 00:00-00:00 America/Chicago"; "Tu,Th 18:00-06:00 America/Chicago"
 
 [2026-07-25T19:54:17+00:00 / 2026-07-25T14:54:17-0500] verify v1.6.8 complete -- 8 unit tests PASSED; py_compile OK; --list dry-run PASSED (plan_0007 all tasks show unrestricted)
+
+# line 876
+[2026-07-26T04:36:44+00:00 / 2026-07-25T23:36:44-0500] (s393) feature+audit v1.6.9 -> v1.7.0
+  autobuilderclaude.py:
+    - SpendLimitError: raise immediately (exit 1, no retry) when monthly spend limit detected
+    - M1 fix: _SPEND_LIMIT_RE check now requires proc.returncode != 0 (prevents false positive on exit 0)
+    - M2 fix: SpendLimitError check moved BEFORE FatalInvocationError check; spend limit in err
+      no longer masked by fatal invocation detection
+    - m3 fix: run_ts inside retry loop now uses '%Y-%m-%dT%H:%M:%S+00:00' (was '%H:%M:%S+00:00')
+    - m4 fix: removed dead `cmd = claude_cmd` alias; Popen uses claude_cmd directly
+    - m5 fix: _license_header_cache_lock added; build_prompt uses double-checked locking
+    - m6 fix: comment added to _RESET_DATE_IANA_RE noting (\w+) is intentional
+    - m7 fix: rollover grace in parse_reset_time() changed from 1 hour to 5 hours (two sites);
+      5 hours = shortest Claude quota window
+    - m8 fix: _MAX_RATE_LIMIT_RETRIES comment added: "N retries = N+1 total attempts"
+    - m9 fix: removed redundant `_out(f'  output tokens: {tok_out}')` line
+    - c1 fix: `Return code: claude[$pid]:` line now indented with 2-space prefix
+    - c2 fix: Python 3.8 shutdown fallback comment expanded: pending workers continue running
+    - Docstrings added to EVERY function and class: professional technical docstring +
+      sixth-grade plain-language version (blank line separator between them)
+    - Version bump to v1.7.0 (header comment and argparse description)
+  README.md:
+    - Added "Monthly spend limit" section (before Rate-limit handling)
+    - Updated Rate-limit handling: limit-keyword phrase now covers up to 3 qualifier words;
+      1-hour rollover grace updated to 5 hours (two mentions)
+    - Token usage section: example updated to show Return code line (removed output tokens line)
